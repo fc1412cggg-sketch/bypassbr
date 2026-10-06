@@ -1247,16 +1247,14 @@ static void tool_diag(HANDLE h, uint64_t base, uint64_t size) {
     wprint(L"===== END DIAG =====\n");
 }
 
-/* ---- --probe v2.10: พิสูจน์ว่า VEH ลงถูกต้องแล้ว (แก้ลำดับ argument) ----
- * พบว่าของเดิมเรียก AddVectoredExceptionHandler(handler, 1) ทั้งที่โปรแกรมจริงคือ
- *   AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
- * → แปลว่าเราลงทะเบียน handler ที่ address=1 มาตลอด พอ deef มี exception ปุ๊บ
- *   มันเรียก address 1 → 0xC0000005 → ตาย (นี่คือ "ตัวฆ่า" ของจริง)
- * R  : สอดแนม ntdll (อ่านอย่างเดียว) — เช็คว่ามี inline hook มั้ย
- * P0 : ลง VEH ด้วยลำดับที่ถูก + ยิง exception ทดสอบ (0xDEADBEEF) เพื่อพิสูจน์ว่า handler ทำงาน
- * P1 : ติดตั้งจริง (arm 0x214370 + entry-redirect) แล้วดูว่า deef รอด + แตกกี่ครั้ง */
+/* ---- --probe v2.11: พิสูจน์ว่า handler ถูกเรียกจริง + ดูว่า NtProtectVirtualMemory โดน hook --
+ * v2.10 พบว่า (1) ntdll!NtProtectVirtualMemory โดน inline hook ใน deef
+ *          (2) ยิง exception 0xDEADBEEF แล้วไม่มี handler ของเราตอบสนอง (ตาย 0xCEADBEEF)
+ * A: สอดแนม ntdll/kernel32/kernelbase + ดูรายการ VEH ก่อน/หลังลง + ยิงพังจุดทดสอบ
+ *    (handler จะแก้ Rip ให้ข้ามคำสั่งที่พัง → ถ้า thread รอด = handler ทำงานจริง)
+ * B: ติดตั้งจริงตั้งแต่ก่อนหน้า login โผล่ (จังหวะที่ถูกต้อง) แล้วดูว่าเข้าหน้าหลักได้ไหม */
 
-static const char *HOOK_NAMES[] = {
+static const char *NTDLL_HOOKS[] = {
     "RtlAddVectoredExceptionHandler", "RtlRemoveVectoredExceptionHandler",
     "RtlDispatchException", "KiUserExceptionDispatcher",
     "RtlEncodePointer", "RtlDecodePointer",
@@ -1270,8 +1268,31 @@ static const char *HOOK_NAMES[] = {
     "NtSetInformationThread", "NtQueryVirtualMemory", "NtAllocateVirtualMemory",
     "NtFreeVirtualMemory", "NtGetTickCount", NULL
 };
+static const char *WIN32_HOOKS[] = {
+    "AddVectoredExceptionHandler", "RemoveVectoredExceptionHandler",
+    "SetUnhandledExceptionFilter", "VirtualProtect", "VirtualProtectEx",
+    "WriteProcessMemory", "ReadProcessMemory", "CreateRemoteThread",
+    "DebugActiveProcess", "IsDebuggerPresent", "CheckRemoteDebuggerPresent",
+    "OutputDebugStringA", "GetThreadContext", "SetThreadContext",
+    "RaiseException", "ExitProcess", "TerminateProcess", "GetTickCount", NULL
+};
 
 typedef struct { uint64_t code; uint64_t addr; } ExcEnt;
+
+/* rip-relative lea/mov: REX(48/4C) + 8D/8B + modrm(mod=00,rm=101) + disp32 */
+static int scan_rip_refs(const uint8_t *code, int len, uint64_t code_addr,
+                         uint64_t *outs, int max) {
+    int i, n = 0;
+    for (i = 0; i + 6 < len && n < max; i++) {
+        int32_t d;
+        if (code[i] != 0x48 && code[i] != 0x4C) continue;
+        if (code[i+1] != 0x8D && code[i+1] != 0x8B) continue;
+        if ((code[i+2] & 0xC7) != 0x05) continue;
+        memcpy(&d, code + i + 3, 4);
+        outs[n++] = code_addr + (uint64_t)i + 7 + (int64_t)d;
+    }
+    return n;
+}
 
 static uint64_t probe_alloc2(HANDLE h, uint64_t *out_mem, uint64_t *out_datab) {
     uint64_t mem = (uint64_t)(uintptr_t)VirtualAllocEx(h, NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -1285,16 +1306,16 @@ static uint64_t probe_alloc2(HANDLE h, uint64_t *out_mem, uint64_t *out_datab) {
     return 1;
 }
 
-/* ลง VEH แบบถูกต้อง: AddVectoredExceptionHandler(1, handler) */
+/* ลง VEH: ใช้ ntdll!RtlAddVectoredExceptionHandler (ntdll ไม่โดน hook — v2.10 พิสูจน์แล้ว) */
 static uint64_t install_veh(HANDLE h, uint64_t handler, uint64_t mem, uint64_t datab) {
     uint8_t stub[128];
     uint8_t doneb[2] = { 0xEB, 0xFE };
-    uint64_t addveh = remote_proc(h, "kernel32.dll", "AddVectoredExceptionHandler");
+    uint64_t addveh = remote_proc(h, "ntdll.dll", "RtlAddVectoredExceptionHandler");
     uint64_t vh = 0;
     int n;
     DWORD old = 0;
     HANDLE rt;
-    if (!addveh) { wprint(L"[!]   หา AddVectoredExceptionHandler ใน deef ไม่เจอ\n"); return 0; }
+    if (!addveh) { wprint(L"[!]   หา RtlAddVectoredExceptionHandler ไม่เจอ\n"); return 0; }
     n = build_rtstub(stub, 1, handler, 0, 0, addveh, datab + 0x80);
     wpm(h, mem + L_RTSTUB, stub, (SIZE_T)n);
     wpm(h, mem + L_DONE, doneb, 2);
@@ -1302,35 +1323,39 @@ static uint64_t install_veh(HANDLE h, uint64_t handler, uint64_t mem, uint64_t d
     rt = CreateRemoteThread(h, NULL, 0, (LPTHREAD_START_ROUTINE)(uintptr_t)(mem + L_RTSTUB), NULL, 0, NULL);
     if (rt) { WaitForSingleObject(rt, 5000); CloseHandle(rt); }
     rpm(h, datab + 0x80, &vh, 8);
-    if (vh) wprint(L"[+]   ลง VEH สำเร็จ handle=0x%llX (เรียกแบบ AddVectoredExceptionHandler(1, handler))\n",
-                   (unsigned long long)vh);
+    if (vh) wprint(L"[+]   ลง VEH สำเร็จ handle=0x%llX (RtlAddVectoredExceptionHandler(1, 0x%llX))\n",
+                   (unsigned long long)vh, (unsigned long long)handler);
     else wprint(L"[!]   ลง VEH ไม่สำเร็จ (handle=0)\n");
     return vh;
 }
 
-/* ยิง exception 0xDEADBEEF ใน deef เพื่อพิสูจน์ว่า handler เราทำงานจริง */
-static void selftest_veh(HANDLE h, uint64_t mem, uint64_t datab) {
-    uint8_t stub[128];
-    uint64_t raise = remote_proc(h, "kernel32.dll", "RaiseException");
-    int n;
+/* จงใจทำให้พัง: xor eax,eax ; mov [rax],eax ; ret  (พังที่ +0x62) */
+static void selftest_fault(HANDLE h, uint64_t mem) {
+    uint8_t stub[8];
     HANDLE rt;
-    if (!raise) { wprint(L"[!]   หา RaiseException ไม่เจอ\n"); return; }
-    n = build_rtstub(stub, 0xDEADBEEF, 0, 0, 0, raise, datab + 0x80);
-    wpm(h, mem + L_RTSTUB, stub, (SIZE_T)n);
-    rt = CreateRemoteThread(h, NULL, 0, (LPTHREAD_START_ROUTINE)(uintptr_t)(mem + L_RTSTUB), NULL, 0, NULL);
-    if (rt) { WaitForSingleObject(rt, 5000); CloseHandle(rt); }
-    wprint(L"[*]   ยิง exception ทดสอบ 0xDEADBEEF แล้ว\n");
+    stub[0] = 0x31; stub[1] = 0xC0;   /* xor eax,eax */
+    stub[2] = 0x89; stub[3] = 0x00;   /* mov [rax],eax  <- จุดที่พัง */
+    stub[4] = 0xC3;                   /* ret */
+    wpm(h, mem + 0x60, stub, 5);
+    rt = CreateRemoteThread(h, NULL, 0, (LPTHREAD_START_ROUTINE)(uintptr_t)(mem + 0x60), NULL, 0, NULL);
+    if (rt) {
+        DWORD ec = 0;
+        WaitForSingleObject(rt, 5000);
+        GetExitCodeThread(rt, &ec);
+        wprint(L"[*]   ยิงจุดพังทดสอบเสร็จ (thread จบ exit=%lu)\n", (unsigned long)ec);
+        CloseHandle(rt);
+    }
 }
 
 static void dump_exc_log(uint64_t total, ExcEnt *ring, uint64_t base) {
     int k, newest;
     wprint(L"[*]   exception log: เห็นทั้งหมด %llu ครั้ง\n", (unsigned long long)total);
     if (!total) {
-        wprint(L"[*]   ไม่มี exception เลย → handler ไม่ได้ถูกเรียก (หรือ deef ไม่มี exception)\n");
+        wprint(L"[*]   ไม่มี exception เลย → handler ไม่ได้ถูกเรียก\n");
         return;
     }
     newest = (int)((total - 1) & 31);
-    for (k = 4; k >= 0; k--) {
+    for (k = 2; k >= 0; k--) {
         int idx = (newest - k + 32) & 31;
         if (total < (uint64_t)(k + 1)) continue;
         wprint(L"      #%llu code=0x%08X addr=0x%llX",
@@ -1341,6 +1366,16 @@ static void dump_exc_log(uint64_t total, ExcEnt *ring, uint64_t base) {
             wprint(L" (deef+0x%llX)", (unsigned long long)(ring[idx].addr - base));
         wprint(L"\n");
     }
+}
+
+static void read_exc_log(HANDLE h, uint64_t datab, uint64_t base) {
+    uint64_t total = 0;
+    ExcEnt ring[32];
+    memset(ring, 0, sizeof(ring));
+    if (!datab) return;
+    rpm(h, datab + 0x100, &total, 8);
+    rpm(h, datab + 0x200, ring, sizeof(ring));
+    dump_exc_log(total, ring, base);
 }
 
 static int probe_watch(HANDLE h, int secs, const wchar_t *tag, uint64_t datab, uint64_t base) {
@@ -1358,16 +1393,103 @@ static int probe_watch(HANDLE h, int secs, const wchar_t *tag, uint64_t datab, u
         if (!target_alive(h)) {
             wprint(L"[DIED] %s: ตายหลัง ~%.1f วินาที! ", tag, (i + 1) * 0.1);
             report_exit(h);
-            if (datab) dump_exc_log(total, ring, base);
+            dump_exc_log(total, ring, base);
             return 0;
         }
     }
     wprint(L"[LIVE] %s: รอดครบ %d วินาที\n", tag, secs);
-    if (datab) dump_exc_log(total, ring, base);
+    dump_exc_log(total, ring, base);
     return 1;
 }
 
-struct WinFind { DWORD pid; HWND hwnd; };
+/* เทียบไบต์แรกของฟังก์ชันในโมดูล ระหว่าง "เรา" กับ "deef" */
+static void scan_module_hooks(HANDLE h, const char *mod, const char *const *names) {
+    HMODULE m = GetModuleHandleA(mod);
+    uint64_t omb, tmb;
+    int i;
+    if (!m) return;
+    omb = (uint64_t)(uintptr_t)m;
+    tmb = get_module_base(h, mod);
+    if (!tmb) { wprint(L"[!] หา %S ใน deef ไม่เจอ\n", mod); return; }
+    if (omb != tmb) wprint(L"[*] %S base: เรา=0x%llX deef=0x%llX (ไม่ตรงกัน)\n",
+                           mod, (unsigned long long)omb, (unsigned long long)tmb);
+    for (i = 0; names[i]; i++) {
+        uint8_t ours[16], theirs[16];
+        FARPROC f = GetProcAddress(m, names[i]);
+        uint64_t rva, abs_f = (uint64_t)(uintptr_t)f;
+        int k;
+        if (!f) continue;
+        /* ฟังก์ชันอาจอยู่ในโมดูลอื่น (forwarder) — คำนวณจากโมดูลที่มันอยู่จริง */
+        {
+            HMODULE real = NULL;
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCSTR)f, &real) && real) {
+                uint64_t rb = (uint64_t)(uintptr_t)real;
+                uint64_t tb = get_module_base(h, NULL);
+                char rn[260] = { 0 };
+                GetModuleBaseNameA(GetCurrentProcess(), real, rn, sizeof(rn));
+                tb = get_module_base(h, rn);
+                if (!tb) continue;
+                memcpy(ours, f, 16);
+                if (!rpm(h, tb + (abs_f - rb), theirs, 16)) continue;
+                if (memcmp(ours, theirs, 16) == 0) continue;
+                wprint(L"    [HOOKED] %S (%S)\n", rn, names[i]);
+            } else continue;
+        }
+        (void)rva; (void)k;
+        wprint(L"        เรา  : ");
+        for (k = 0; k < 16; k++) wprint(L"%02X ", ours[k]);
+        wprint(L"\n        deef : ");
+        for (k = 0; k < 16; k++) wprint(L"%02X ", theirs[k]);
+        wprint(L"\n");
+    }
+}
+
+/* หา LdrpVectorHandlerList จากสำเนาสะอาดของเรา แล้วเดินดูรายการ VEH ใน deef */
+static void dump_veh_list(HANDLE h, uint64_t tnb, uint64_t list_rva, uint64_t cookie,
+                          const wchar_t *when) {
+    uint64_t cands[2];
+    int c, idx;
+    if (!list_rva) return;
+    cands[0] = tnb + list_rva;
+    cands[1] = tnb + list_rva + 8;
+    wprint(L"[*] รายการ VEH %s (ตัวแปร ntdll+0x%llX):\n", when, (unsigned long long)list_rva);
+    for (c = 0; c < 2; c++) {
+        uint64_t head = cands[c], flink = 0, blink = 0, chk = 0, cur;
+        rpm(h, head + 0, &flink, 8);
+        rpm(h, head + 8, &blink, 8);
+        if (!flink || !blink) continue;
+        rpm(h, flink + 8, &chk, 8);
+        if (!(flink == head && blink == head) && chk != head) continue;
+        wprint(L"    หัวแถว=0x%llX (offset +%d) %s\n", (unsigned long long)head, c * 8,
+               (flink == head) ? L"[ว่าง]" : L"");
+        cur = flink;
+        for (idx = 0; idx < 10; idx++) {
+            uint64_t nxt = 0, hnd = 0, refs = 0;
+            if (!cur || cur == head) break;
+            rpm(h, cur + 0x00, &nxt, 8);
+            rpm(h, cur + 0x10, &hnd, 8);
+            rpm(h, cur + 0x18, &refs, 8);
+            wprint(L"      #%d entry=0x%llX handler(raw)=0x%llX +0x18=0x%llX",
+                   idx, (unsigned long long)cur, (unsigned long long)hnd,
+                   (unsigned long long)refs);
+            if (cookie) {
+                uint64_t dec = hnd ^ cookie;
+                wprint(L"\n          ถอดรหัส=0x%llX", (unsigned long long)dec);
+                if (dec >= tnb && dec < tnb + 0x400000)
+                    wprint(L" (ใน ntdll+0x%llX)", (unsigned long long)(dec - tnb));
+            }
+            wprint(L"\n");
+            if (!nxt || nxt == head || nxt == cur) break;
+            cur = nxt;
+        }
+        return;
+    }
+    wprint(L"    (เดินแถวไม่ได้ — structure อาจต่างจากที่คาด)\n");
+}
+
+struct WinFind { DWORD pid; HWND hwnd; char title[256]; };
 static BOOL CALLBACK enum_win_cb(HWND hw, LPARAM lp) {
     struct WinFind *w = (struct WinFind *)lp;
     DWORD pid = 0;
@@ -1379,105 +1501,109 @@ static BOOL CALLBACK enum_win_cb(HWND hw, LPARAM lp) {
     GetWindowTextA(hw, title, sizeof(title));
     if (!title[0]) return TRUE;
     w->hwnd = hw;
+    strcpy(w->title, title);
     return FALSE;
 }
-static void wait_window(DWORD pid, int max_secs) {
+static int wait_window(DWORD pid, int max_secs) {
     int i;
     for (i = 0; i < max_secs * 4; i++) {
         struct WinFind w;
-        char title[256];
         wchar_t wt[256];
-        w.pid = pid; w.hwnd = NULL;
+        w.pid = pid; w.hwnd = NULL; w.title[0] = 0;
         Sleep(250);
         EnumWindows(enum_win_cb, (LPARAM)&w);
         if (w.hwnd) {
-            title[0] = 0;
-            GetWindowTextA(w.hwnd, title, sizeof(title));
-            towide(title, wt, 256);
+            towide(w.title, wt, 256);
             wprint(L"[+]   เห็นหน้าต่างแล้ว (~%.1f วิ): \"%s\"\n", (i + 1) * 0.25, wt);
-            return;
+            return 1;
         }
     }
     wprint(L"[!]   รอหน้าต่างครบ %d วิแล้วยังไม่โผล่\n", max_secs);
-}
-
-static void recon(HANDLE h, uint64_t base) {
-    HMODULE our_ntdll = GetModuleHandleA("ntdll.dll");
-    uint64_t onb = (uint64_t)(uintptr_t)our_ntdll;
-    uint64_t tnb = get_module_base(h, "ntdll.dll");
-    int i;
-    (void)base;
-    wprint(L"\n----- RECON (อ่านอย่างเดียว) -----\n");
-    if (!tnb) { wprint(L"[!] หา ntdll ใน deef ไม่เจอ\n"); return; }
-    wprint(L"[*] ntdll: เรา=0x%llX deef=0x%llX %s\n", (unsigned long long)onb,
-           (unsigned long long)tnb, onb == tnb ? L"(base เดียวกัน)" : L"(base ไม่ตรงกัน)");
-    for (i = 0; HOOK_NAMES[i]; i++) {
-        uint8_t ours[16], theirs[16];
-        FARPROC f = GetProcAddress(our_ntdll, HOOK_NAMES[i]);
-        uint64_t rva;
-        int k;
-        if (!f) continue;
-        rva = (uint64_t)(uintptr_t)f - onb;
-        memset(ours, 0, 16); memset(theirs, 0, 16);
-        memcpy(ours, f, 16);
-        if (!rpm(h, tnb + rva, theirs, 16)) continue;
-        if (memcmp(ours, theirs, 16) == 0) continue;
-        wprint(L"    [HOOKED] %S\n", HOOK_NAMES[i]);
-        wprint(L"        เรา  : ");
-        for (k = 0; k < 16; k++) wprint(L"%02X ", ours[k]);
-        wprint(L"\n        deef : ");
-        for (k = 0; k < 16; k++) wprint(L"%02X ", theirs[k]);
-        wprint(L"\n");
-    }
-    wprint(L"[*] จบการเทียบ ntdll (ที่ไม่ขึ้น = เหมือนกันทุกไบต์ = ไม่มี hook)\n");
-    wprint(L"----- จบ RECON -----\n\n");
+    return 0;
 }
 
 static int tool_probe(const char *target_exe, const char *exe_dir) {
-    int live[3] = { 0, 0, 0 };
-    int opened[3] = { 0, 0, 0 };
+    int live[2] = { 0, 0 };
+    int opened[2] = { 0, 0 };
     int s;
-    static const wchar_t *tags[3] = {
-        L"R  สอดแนม ntdll (อ่านอย่างเดียว)",
-        L"P0 ลง VEH (ลำดับถูก) + ยิง exception ทดสอบ",
-        L"P1 ติดตั้งจริง arm 0x214370 + entry-redirect"
+    static const wchar_t *tags[2] = {
+        L"A  พิสูจน์ว่า handler ถูกเรียก (ยิงจุดพังทดสอบ)",
+        L"B  ติดตั้งจริงก่อนหน้า login โผล่"
     };
-    wprint(L"[*] probe v2.10: พิสูจน์ว่า VEH ทำงาน + ทดสอบทางผ่านจริง (3 รอบ)\n");
-    for (s = 0; s < 3; s++) {
+    wprint(L"[*] probe v2.11: พิสูจน์ handler + ดู hook + ทดสอบของจริง (2 รอบ)\n");
+    for (s = 0; s < 2; s++) {
         DWORD pid = 0;
         HANDLE h = NULL;
         uint64_t base = 0;
         kill_deef();
-        wprint(L"\n===== PROBE %d/3 =====\n", s);
+        wprint(L"\n===== PROBE %d/2 =====\n", s);
         if (!open_target(target_exe, exe_dir, &pid, &h, &base)) {
             wprint(L"[DIED] ขั้น %d: เปิด/wait ไม่ผ่านตั้งแต่ต้น\n", s);
             continue;
         }
         opened[s] = 1;
-        wait_window(pid, 45);
         if (s == 0) {
-            recon(h, base);
-            live[s] = probe_watch(h, 8, tags[s], 0, base);
-        } else if (s == 1) {
+            uint64_t tnb = get_module_base(h, "ntdll.dll");
             uint64_t mem = 0, datab = 0, vh;
-            uint8_t veh[128];
+            uint8_t veh[160];
             int n;
-            DWORD old = 0;
+            uint64_t list_rva = 0, cookie = 0;
+            wprint(L"\n----- RECON -----\n");
+            wprint(L"[*] ntdll:\n"); scan_module_hooks(h, "ntdll.dll", NTDLL_HOOKS);
+            wprint(L"[*] kernel32:\n"); scan_module_hooks(h, "kernel32.dll", WIN32_HOOKS);
+            wprint(L"[*] kernelbase:\n"); scan_module_hooks(h, "kernelbase.dll", WIN32_HOOKS);
+            {
+                FARPROC f = GetProcAddress(GetModuleHandleA("ntdll.dll"),
+                                           "RtlAddVectoredExceptionHandler");
+                uint8_t code[64];
+                uint64_t cands[8];
+                int k, cnt;
+                memset(cands, 0, sizeof(cands));
+                memcpy(code, f, 64);
+                cnt = scan_rip_refs(code, 64, (uint64_t)(uintptr_t)f, cands, 8);
+                for (k = 0; k < cnt; k++) {
+                    uint64_t rva = cands[k] - (uint64_t)(uintptr_t)GetModuleHandleA("ntdll.dll");
+                    uint64_t v = 0;
+                    if (cands[k] < (uint64_t)(uintptr_t)GetModuleHandleA("ntdll.dll")) continue;
+                    if (rva > 0x400000) continue;
+                    rpm(h, cands[k], &v, 8);
+                    wprint(L"[*] RtlAddVectoredExceptionHandler อ้างถึง ntdll+0x%llX (ค่า=0x%llX)\n",
+                           (unsigned long long)rva, (unsigned long long)v);
+                    if (!list_rva) list_rva = rva;
+                }
+                f = GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlEncodePointer");
+                memcpy(code, f, 64);
+                cnt = scan_rip_refs(code, 64, (uint64_t)(uintptr_t)f, cands, 8);
+                if (cnt > 0) {
+                    cookie = 0;
+                    rpm(h, cands[0], &cookie, 8);
+                    wprint(L"[*] RtlEncodePointer ใช้ cookie ที่ ntdll+0x%llX = 0x%llX\n",
+                           (unsigned long long)(cands[0] -
+                               (uint64_t)(uintptr_t)GetModuleHandleA("ntdll.dll")),
+                           (unsigned long long)cookie);
+                }
+            }
+            wprint(L"----- จบ RECON -----\n\n");
+            dump_veh_list(h, tnb, list_rva, cookie, L"ก่อนลง VEH");
             if (!probe_alloc2(h, &mem, &datab)) { CloseHandle(h); continue; }
-            n = sc_test_veh(veh, datab);
+            n = sc_test_veh2(veh, datab, mem + 0x62);
             wpm(h, mem + L_VEH, veh, (SIZE_T)n);
             vh = install_veh(h, mem + L_VEH, mem, datab);
             if (!vh) { CloseHandle(h); continue; }
-            selftest_veh(h, mem, datab);
-            live[s] = probe_watch(h, 12, tags[s], datab, base);
+            dump_veh_list(h, tnb, list_rva, cookie, L"หลังลง VEH");
+            selftest_fault(h, mem);
+            wprint(L"[*] อ่าน log ทันทีหลังยิงจุดพัง:\n");
+            read_exc_log(h, datab, base);
+            live[s] = probe_watch(h, 8, tags[s], datab, base);
         } else {
             uint64_t mem = 0, datab = 0, vh;
             uint64_t hook = base + RVA_LOGIN_SCREEN;
             uint64_t main_screen = base + RVA_MAIN_SCREEN;
             uint64_t code_addr, user_str, key_str, user_lng, key_lng, counter;
-            uint8_t veh[128], code[512], st[32], longbuf[256];
-            int n, armed;
+            uint8_t veh[160], code[512], st[32], longbuf[256];
+            int n, armed, i;
             DWORD old = 0;
+            uint64_t hits = 0, shown = 0;
             if (!probe_alloc2(h, &mem, &datab)) { CloseHandle(h); continue; }
             code_addr = mem + L_CODE; user_str = mem + L_USER_STR; key_str = mem + L_KEY_STR;
             user_lng = mem + L_USER_LONG; key_lng = mem + L_KEY_LONG;
@@ -1491,42 +1617,48 @@ static int tool_probe(const char *target_exe, const char *exe_dir) {
             sc_std_string(st, "ARENA-2026-FREE", key_lng, longbuf);
             wpm(h, key_str, st, 32);
             VirtualProtectEx(h, (LPVOID)(uintptr_t)mem, 4096, PAGE_EXECUTE_READ, &old);
-            wprint(L"[*]   ติดตั้งจริง: hook=0x%llX shellcode=%d ไบต์\n",
-                   (unsigned long long)hook, n);
+            wprint(L"[*] ติดตั้งจริงทันที (ก่อนหน้า login โผล่): hook=0x%llX\n",
+                   (unsigned long long)hook);
             vh = install_veh(h, mem + L_VEH, mem, datab);
             if (!vh) { CloseHandle(h); continue; }
             armed = arm_threads(pid, hook, 0);
-            wprint(L"[*]   ใส่ hardware breakpoint แล้ว %d threads\n", armed);
-            {
-                int i;
-                uint64_t hits = 0, shown = 0;
-                for (i = 0; i < 200; i++) {
-                    Sleep(100);
-                    if (!target_alive(h)) {
-                        wprint(L"[DIED] %s: ตายหลัง ~%.1f วินาที! ", tags[s], (i + 1) * 0.1);
-                        report_exit(h);
-                        break;
-                    }
-                    if (rpm(h, counter, &hits, 8) && hits != shown) {
-                        wprint(L"[HIT] จุด login แตกแล้ว รวม %llu ครั้ง\n", (unsigned long long)hits);
-                        shown = hits;
-                    }
+            wprint(L"[*] ใส่ hardware breakpoint แล้ว %d threads\n", armed);
+            for (i = 0; i < 400; i++) {
+                Sleep(100);
+                if (!target_alive(h)) {
+                    wprint(L"[DIED] %s: ตายหลัง ~%.1f วินาที! ", tags[s], (i + 1) * 0.1);
+                    report_exit(h);
+                    break;
                 }
-                if (target_alive(h)) {
-                    live[s] = 1;
-                    wprint(L"[LIVE] %s: รอดครบ 20 วินาที (แตก %llu ครั้ง)\n", tags[s],
+                if (rpm(h, counter, &hits, 8) && hits != shown) {
+                    wprint(L"[HIT] จุด login แตกแล้ว รวม %llu ครั้ง\n", (unsigned long long)hits);
+                    shown = hits;
+                }
+                if (i % 25 == 24) {
+                    struct WinFind w;
+                    wchar_t wt[256];
+                    w.pid = pid; w.hwnd = NULL; w.title[0] = 0;
+                    EnumWindows(enum_win_cb, (LPARAM)&w);
+                    towide(w.title, wt, 256);
+                    wprint(L"[*] t=%.1fวิ หน้าต่าง: \"%s\" (hits=%llu)\n",
+                           (i + 1) * 0.1, wt[0] ? wt : L"(ไม่มี)",
                            (unsigned long long)hits);
                 }
+            }
+            if (target_alive(h)) {
+                live[s] = 1;
+                wprint(L"[LIVE] %s: รอดครบ 40 วินาที (แตก %llu ครั้ง)\n", tags[s],
+                       (unsigned long long)hits);
             }
         }
         CloseHandle(h);
     }
     kill_deef();
     wprint(L"\n===== PROBE SUMMARY =====\n");
-    for (s = 0; s < 3; s++)
-        wprint(L"  %s: %s\n", s == 0 ? L"R " : (s == 1 ? L"P0" : L"P1"),
+    for (s = 0; s < 2; s++)
+        wprint(L"  %s: %s\n", s == 0 ? L"A" : L"B",
                !opened[s] ? L"เปิดไม่ติด" : live[s] ? L"รอด" : L"ตาย");
-    wprint(L"[*] ถ้า P0 รอดและ log มี 0xDEADBEEF = VEH ทำงานจริง; ถ้า P1 รอดและมี HIT = ทะลุ login แล้ว\n");
+    wprint(L"[*] ส่ง RECON + log ทั้งหมดมา (สำคัญสุด: exception log ของ A ต้องมี 1 ครั้งขึ้นไป)\n");
     return 0;
 }
 
@@ -1561,7 +1693,7 @@ int main(int argc, char **argv) {
     }
 
     wprint(L"=================================================\n");
-    wprint(L"     LOGIN KEY PATCHER v2.10 (ARG-FIX)          \n");
+    wprint(L"     LOGIN KEY PATCHER v2.11 (VEH PROOF)          \n");
     wprint(L"=================================================\n");
 
     GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir));

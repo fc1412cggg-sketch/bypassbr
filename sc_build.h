@@ -342,6 +342,28 @@ static int sc_test_veh(uint8_t *out, uint64_t datab) {
     return (int)(p - out);
 }
 
+/* SELF-TEST VEH v2: บันทึก exception ทุกตัว แล้ว
+ *   ถ้า ExceptionAddress == fault_addr (จุดที่เราจงใจทำให้พัง)
+ *     -> แก้ Context->Rip = fault_addr+2 (ข้ามคำสั่งที่พัง) แล้วคืน CONTINUE_EXECUTION
+ *   อื่น ๆ -> คืน CONTINUE_SEARCH
+ * ถ้า thread ทดสอบรอดกลับมาได้ = handler เราถูกเรียกจริงและทำงานได้จริง */
+static int sc_test_veh2(uint8_t *out, uint64_t datab, uint64_t fault_addr) {
+    int n = sc_log_veh(out, datab);
+    uint8_t *p = out + n - 6;
+    *p++ = 0x48; *p++ = 0xB8; { uint64_t a = fault_addr;        memcpy(p, &a, 8); p += 8; }
+    *p++ = 0x49; *p++ = 0x39; *p++ = 0xC1;                       /* cmp r9, rax */
+    *p++ = 0x75; *p++ = 0x18;                                    /* jne -> search */
+    *p++ = 0x48; *p++ = 0x8B; *p++ = 0x51; *p++ = 0x08;           /* mov rdx,[rcx+8] (Context) */
+    *p++ = 0x48; *p++ = 0xB8; { uint64_t a = fault_addr + 2;     memcpy(p, &a, 8); p += 8; }
+    *p++ = 0x48; *p++ = 0x89; *p++ = 0x82;
+    *p++ = 0xF8; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;           /* mov [rdx+0xF8], rax (Rip) */
+    *p++ = 0x31; *p++ = 0xC0;                                    /* xor eax,eax */
+    *p++ = 0xC3;                                                 /* ret */
+    *p++ = 0xB8; *p++ = 0x01; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; /* mov eax,1 */
+    *p++ = 0xC3;
+    return (int)(p - out);
+}
+
 /* MSVC std::string (32 bytes). If text > 15 chars, chars (+NUL) go to longbuf
  * and the struct points at longaddr. longbuf must fit strlen(text)+1. */
 static void sc_std_string(uint8_t st[32], const char *text, uint64_t longaddr, uint8_t *longbuf) {
