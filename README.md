@@ -12,6 +12,19 @@ Login-key bypass / patcher for `deef.exe` (x64, Enigma-protected).
 
 > `.exe` เป็น native x64 ไฟล์เดียว ไม่ต้องลง .NET / Python / อะไรเพิ่ม —
 > รันบน Windows 10/11 ได้เลย ถ้าติดตั้ง VEH ไม่ได้ให้รันแบบ **Run as Administrator**
+
+## รวมเป็น exe ตัวเดียว (bundle + deef.exe)
+
+```
+1. วาง LoginKeyPatcher.exe + deef.exe + Build_SingleExe.bat ในโฟลเดอร์เดียวกัน
+2. รัน Build_SingleExe.bat ครั้งเดียว → ได้ PlayDeef.exe (~95 MB)
+3. จากนี้ไปดับเบิลคลิกแค่ PlayDeef.exe ตัวเดียว
+```
+
+> รันครั้งแรกจะแตก `deef.exe` ออกมาข้างๆ อัตโนมัติ (ครั้งต่อไปข้ามให้)
+> ใช้โหมดได้เหมือนเดิม: `PlayDeef.exe any / auto / custom KEY / --diag`
+> หมายเหตุ: patch ถาวรลงไฟล์ deef.exe ไม่ได้ (Enigma เช็คไฟล์) —
+> bundle จึงแตกไฟล์ + patch ใน memory ให้อัตโนมัติทุกครั้งที่รัน
 >
 > v2 ใช้วิธี **STEALTH: ไม่แก้โค้ด deef.exe ใน memory เลยสัก byte**
 > (เลี่ยง Enigma "File corrupted!" check) ด้วย hardware breakpoint + VEH —

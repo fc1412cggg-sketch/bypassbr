@@ -756,6 +756,68 @@ static void walk_image(HANDLE h, uint64_t base, uint64_t size, int exec_only, ch
 }
 
 /* ---- shared target open: find/launch + wait unpack ---- */
+
+/* Single-exe bundle support: if deef.exe is missing next to us, look for it
+ * appended to our own file (payload + 16-byte footer: [u64 size][8B magic]).
+ * Returns 1 if deef.exe is present afterwards, 0 otherwise. */
+static int extract_bundled_deef(const char *target_exe) {
+    char self[512];
+    HANDLE hf, out;
+    LARGE_INTEGER fsz, off;
+    uint8_t foot[16];
+    uint64_t dsize, left, doff;
+    DWORD rd;
+    uint8_t *buf;
+    if (!GetModuleFileNameA(NULL, self, sizeof(self))) return 0;
+    hf = CreateFileA(self, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (hf == INVALID_HANDLE_VALUE) return 0;
+    if (!GetFileSizeEx(hf, &fsz) || fsz.QuadPart < 64) { CloseHandle(hf); return 0; }
+    off.QuadPart = fsz.QuadPart - 16;
+    if (!SetFilePointerEx(hf, off, NULL, FILE_BEGIN)) { CloseHandle(hf); return 0; }
+    if (!ReadFile(hf, foot, 16, &rd, NULL) || rd != 16) { CloseHandle(hf); return 0; }
+    if (memcmp(foot + 8, "LKPBNDL1", 8) != 0) { CloseHandle(hf); return 0; } /* not a bundle */
+    memcpy(&dsize, foot, 8);
+    if (dsize < 1000000ULL || dsize + 16 >= (uint64_t)fsz.QuadPart) { CloseHandle(hf); return 0; }
+    { /* skip extraction if the file already matches */
+        HANDLE ex = CreateFileA(target_exe, GENERIC_READ, FILE_SHARE_READ, NULL,
+                                OPEN_EXISTING, 0, NULL);
+        if (ex != INVALID_HANDLE_VALUE) {
+            LARGE_INTEGER esz;
+            if (GetFileSizeEx(ex, &esz) && (uint64_t)esz.QuadPart == dsize) {
+                CloseHandle(ex);
+                CloseHandle(hf);
+                wprint(L"[*] deef.exe มีอยู่แล้ว (ขนาดตรง) — ข้ามการแตกไฟล์\n");
+                return 1;
+            }
+            CloseHandle(ex);
+        }
+    }
+    wprint(L"[*] แตกไฟล์ deef.exe จาก bundle (%llu MB)...\n",
+           (unsigned long long)(dsize / 1048576));
+    doff = (uint64_t)fsz.QuadPart - 16 - dsize;
+    off.QuadPart = (LONGLONG)doff;
+    if (!SetFilePointerEx(hf, off, NULL, FILE_BEGIN)) { CloseHandle(hf); return 0; }
+    out = CreateFileA(target_exe, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (out == INVALID_HANDLE_VALUE) { CloseHandle(hf); return 0; }
+    buf = (uint8_t *)malloc(1024 * 1024);
+    if (!buf) { CloseHandle(out); CloseHandle(hf); return 0; }
+    left = dsize;
+    while (left > 0) {
+        DWORD chunk = (left > 1048576) ? 1048576 : (DWORD)left;
+        DWORD got = 0, wrote = 0;
+        if (!ReadFile(hf, buf, chunk, &got, NULL) || got == 0) break;
+        WriteFile(out, buf, got, &wrote, NULL);
+        if (wrote != got) break;
+        left -= got;
+    }
+    free(buf);
+    CloseHandle(out);
+    CloseHandle(hf);
+    if (left != 0) { DeleteFileA(target_exe); return 0; }
+    wprint(L"[+] แตกไฟล์เสร็จ\n");
+    return 1;
+}
+
 static int open_target(const char *target_exe, const char *exe_dir,
                        DWORD *out_pid, HANDLE *out_h, uint64_t *out_base) {
     DWORD pid = find_pid("deef.exe");
@@ -767,10 +829,14 @@ static int open_target(const char *target_exe, const char *exe_dir,
     } else {
         DWORD attr = GetFileAttributesA(target_exe);
         if (attr == INVALID_FILE_ATTRIBUTES) {
-            wchar_t wdir[512];
-            towide(exe_dir, wdir, 512);
-            wprint(L"[!] ไม่พบไฟล์ deef.exe ใน %s\n", wdir);
-            return 0;
+            if (!extract_bundled_deef(target_exe)) {
+                wchar_t wdir[512];
+                towide(exe_dir, wdir, 512);
+                wprint(L"[!] ไม่พบไฟล์ deef.exe ใน %s\n", wdir);
+                return 0;
+            }
+            attr = GetFileAttributesA(target_exe);
+            if (attr == INVALID_FILE_ATTRIBUTES) return 0;
         }
         wprint(L"[*] กำลังเปิด deef.exe...\n");
         {
@@ -1120,7 +1186,7 @@ int main(int argc, char **argv) {
     }
 
     wprint(L"=================================================\n");
-    wprint(L"     LOGIN KEY PATCHER v2.2 (STEALTH + TRACER)    \n");
+    wprint(L"     LOGIN KEY PATCHER v2.3 (STEALTH + TRACER)    \n");
     wprint(L"=================================================\n");
 
     GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir));
