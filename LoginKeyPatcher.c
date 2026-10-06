@@ -1242,18 +1242,22 @@ static void tool_diag(HANDLE h, uint64_t base, uint64_t size) {
     wprint(L"===== END DIAG =====\n");
 }
 
-/* ---- --probe: find which step kills deef (4 fresh launches, back-to-back) ----
- * S0: launch + unpack-wait only (touch nothing)
- * S1: + install VEH (no breakpoints armed)
- * S2: + arm a dead address (RVA 0 = header bytes, never executes)
- * S3: + arm RVA 0x214370 (the real suspect) */
-static uint64_t probe_install_veh(HANDLE h, DWORD pid, uint64_t *addrs, int n,
-                                  uint64_t *out_mem, uint64_t *out_datab) {
+/* ---- --probe v2.7: แยกว่าตัวฆ่าคือ (a) จังหวะฉีด (b) การ hijack thread (c) การลง VEH ----
+ * ทุกขั้นใช้ VEH ตัวเดียวกัน = OBSERVER (บันทึก exception ทุกตัว, ไม่แตะอะไร, คืน SEARCH)
+ *   datab+0x100 = นับรวม, datab+0x200 = ring 32 ช่อง {code,addr}
+ * S0: เปิดเฉย ๆ ไม่แตะอะไร
+ * S1: เปิดแล้วฉีดทันที (hijack)      <- เคยตาย ~7 วิ (control)
+ * S2: เปิด รอจนหน้าต่าง login โผล่ แล้วฉีด (hijack)
+ * S3: เปิด รอหน้าต่าง แล้วฉีดด้วย CreateRemoteThread (ไม่แตะ thread context) */
+typedef struct { uint64_t code; uint64_t addr; } ExcEnt;
+
+static uint64_t probe_install(HANDLE h, DWORD pid, int use_rt,
+                              uint64_t *out_mem, uint64_t *out_datab) {
     uint64_t mem, datab, veh_addr, done_addr, stub_addr;
     uint8_t veh[128], stub[64];
     int veh_len, stub_len;
     DWORD old = 0;
-    uint64_t vh;
+    uint64_t vh = 0;
     mem = (uint64_t)(uintptr_t)VirtualAllocEx(h, NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     datab = (uint64_t)(uintptr_t)VirtualAllocEx(h, NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!mem || !datab) {
@@ -1261,43 +1265,115 @@ static uint64_t probe_install_veh(HANDLE h, DWORD pid, uint64_t *addrs, int n,
         return 0;
     }
     veh_addr = mem + L_VEH; done_addr = mem + L_DONE; stub_addr = mem + L_RTSTUB;
-    veh_len = sc_trace_veh(veh, datab, datab + 0x40);
-    wpm(h, datab + 0x40, addrs, (SIZE_T)(n * 8));
+    veh_len = sc_log_veh(veh, datab);
     {
         FARPROC addveh = GetProcAddress(GetModuleHandleA("kernel32.dll"), "AddVectoredExceptionHandler");
         stub_len = build_rtstub(stub, veh_addr, (uint64_t)(uintptr_t)addveh, datab + 0x80);
     }
-    wpm(h, veh_addr, veh, veh_len);
+    wpm(h, veh_addr, veh, (SIZE_T)veh_len);
     {
         uint8_t doneb[2] = { 0xEB, 0xFE };
         wpm(h, done_addr, doneb, 2);
     }
-    wpm(h, stub_addr, stub, stub_len);
+    wpm(h, stub_addr, stub, (SIZE_T)stub_len);
     VirtualProtectEx(h, (LPVOID)(uintptr_t)mem, 4096, PAGE_EXECUTE_READ, &old);
-    vh = remote_add_veh_hijack(h, pid, veh_addr, done_addr);
-    if (vh) wprint(L"[*] VEH via hijack handle=0x%llX\n", (unsigned long long)vh);
-    else {
+    if (use_rt) {
         vh = remote_add_veh_remote_thread(h, stub_addr, datab + 0x80);
         if (vh) wprint(L"[*] VEH via CreateRemoteThread handle=0x%llX\n", (unsigned long long)vh);
+    } else {
+        vh = remote_add_veh_hijack(h, pid, veh_addr, done_addr);
+        if (vh) wprint(L"[*] VEH via hijack handle=0x%llX\n", (unsigned long long)vh);
+        else {
+            vh = remote_add_veh_remote_thread(h, stub_addr, datab + 0x80);
+            if (vh) wprint(L"[*] VEH via CreateRemoteThread (fallback) handle=0x%llX\n", (unsigned long long)vh);
+        }
     }
+    (void)veh_len; (void)stub_len;
     *out_mem = mem;
     *out_datab = datab;
-    (void)veh_len; (void)stub_len;
     return vh;
 }
 
-static int probe_wait(HANDLE h, int secs, const wchar_t *tag) {
-    int i;
-    for (i = 0; i < secs * 2; i++) {
-        Sleep(500);
+static void dump_exc_log(uint64_t total, ExcEnt *ring, uint64_t base) {
+    int k, newest;
+    wprint(L"[*] exception log: เห็นทั้งหมด %llu ครั้ง\n", (unsigned long long)total);
+    if (!total) {
+        wprint(L"[*] ไม่มี exception เลย → deef โดนปิดเอง/โดนฆ่า (ไม่ใช่ crash)\n");
+        return;
+    }
+    newest = (int)((total - 1) & 31);
+    for (k = 4; k >= 0; k--) {
+        int idx = (newest - k + 32) & 31;
+        if (total < (uint64_t)(k + 1)) continue;
+        wprint(L"    #%llu code=0x%08X addr=0x%llX",
+               (unsigned long long)(total - k),
+               (unsigned)(ring[idx].code & 0xFFFFFFFFu),
+               (unsigned long long)ring[idx].addr);
+        if (ring[idx].addr >= base && ring[idx].addr < base + 0x10000000)
+            wprint(L" (deef+0x%llX)", (unsigned long long)(ring[idx].addr - base));
+        wprint(L"\n");
+    }
+}
+
+/* watch with 100 ms polling so the fatal exception has a chance to be logged */
+static int probe_watch(HANDLE h, int secs, const wchar_t *tag, uint64_t datab, uint64_t base) {
+    int i, iters = secs * 10;
+    uint64_t total = 0;
+    ExcEnt ring[32], tmp[32];
+    memset(ring, 0, sizeof(ring));
+    for (i = 0; i < iters; i++) {
+        uint64_t t = 0;
+        Sleep(100);
+        if (rpm(h, datab + 0x100, &t, 8)) total = t;
+        if (rpm(h, datab + 0x200, tmp, sizeof(tmp))) memcpy(ring, tmp, sizeof(ring));
         if (!target_alive(h)) {
-            wprint(L"[DIED] %s: deef ตายหลัง ~%d วินาที! ", tag, (i + 1) / 2);
+            wprint(L"[DIED] %s: deef ตายหลัง ~%.1f วินาที! ", tag, (i + 1) * 0.1);
             report_exit(h);
+            dump_exc_log(total, ring, base);
             return 0;
         }
     }
-    wprint(L"[LIVE] %s: รอดครบ %d วินาที\n", tag, secs);
+    wprint(L"[LIVE] %s: รอดครบ %d วินาที (exception %llu ครั้ง)\n",
+           tag, secs, (unsigned long long)total);
     return 1;
+}
+
+/* wait until deef shows a visible window (login UI up = Enigma finished init) */
+struct WinFind { DWORD pid; HWND hwnd; };
+static BOOL CALLBACK enum_win_cb(HWND hw, LPARAM lp) {
+    struct WinFind *w = (struct WinFind *)lp;
+    DWORD pid = 0;
+    char title[256];
+    if (!IsWindowVisible(hw)) return TRUE;
+    GetWindowThreadProcessId(hw, &pid);
+    if (pid != w->pid) return TRUE;
+    title[0] = 0;
+    GetWindowTextA(hw, title, sizeof(title));
+    if (!title[0]) return TRUE;
+    w->hwnd = hw;
+    return FALSE;
+}
+static int wait_window(DWORD pid, int max_secs) {
+    int i;
+    for (i = 0; i < max_secs * 4; i++) {
+        struct WinFind w;
+        char title[256];
+        w.pid = pid; w.hwnd = NULL;
+        Sleep(250);
+        EnumWindows(enum_win_cb, (LPARAM)&w);
+        if (w.hwnd) {
+            title[0] = 0;
+            GetWindowTextA(w.hwnd, title, sizeof(title));
+            {
+                wchar_t wt[256];
+                towide(title, wt, 256);
+                wprint(L"[+] เห็นหน้าต่าง deef แล้วหลัง ~%.1f วินาที: \"%s\"\n", (i + 1) * 0.25, wt);
+            }
+            return (i + 1) / 4 + 1;
+        }
+    }
+    wprint(L"[!] รอหน้าต่างครบ %d วินาทีแล้วยังไม่โผล่\n", max_secs);
+    return -1;
 }
 
 static int tool_probe(const char *target_exe, const char *exe_dir) {
@@ -1305,12 +1381,12 @@ static int tool_probe(const char *target_exe, const char *exe_dir) {
     int opened[4] = { 0, 0, 0, 0 };
     int s;
     static const wchar_t *tags[4] = {
-        L"S0: แค่เปิดโปรแกรม (ไม่แตะอะไรเลย)",
-        L"S1: +ติดตั้ง VEH (ยังไม่ arm)",
-        L"S2: +arm จุดตาย (RVA 0 — ไม่มีทางแตก)",
-        L"S3: +arm 0x214370 (จุดสงสัย)"
+        L"S0: เปิดเฉย ๆ ไม่แตะอะไรเลย",
+        L"S1: เปิดแล้วฉีด VEH ทันที (hijack)",
+        L"S2: รอหน้าต่าง login โผล่ แล้วฉีด (hijack)",
+        L"S3: รอหน้าต่าง แล้วฉีด (CreateRemoteThread)"
     };
-    wprint(L"[*] probe: เปิด deef ใหม่ 4 รอบ รอบละขั้น — ดูว่ารอบไหนตาย (ใช้เวลา ~2 นาที)\n");
+    wprint(L"[*] probe v2.7: แยกตัวฆ่า — จังหวะฉีด / การ hijack / การลง VEH (~2-3 นาที)\n");
     for (s = 0; s < 4; s++) {
         DWORD pid = 0;
         HANDLE h = NULL;
@@ -1323,19 +1399,17 @@ static int tool_probe(const char *target_exe, const char *exe_dir) {
         }
         opened[s] = 1;
         if (s == 0) {
-            live[s] = probe_wait(h, 15, tags[s]);
+            live[s] = probe_watch(h, 15, tags[s], 0, base);
         } else {
             uint64_t mem = 0, datab = 0, vh;
-            uint64_t addrs[1];
-            addrs[0] = base + (s == 3 ? RVA_LOGIN_SCREEN : 0);
-            vh = probe_install_veh(h, pid, addrs, 1, &mem, &datab);
+            if (s >= 2) wait_window(pid, 45);
+            vh = probe_install(h, pid, s == 3 ? 1 : 0, &mem, &datab);
             if (!vh) {
                 wprint(L"[DIED] S%d: ติดตั้ง VEH ไม่สำเร็จ\n", s);
                 CloseHandle(h);
                 continue;
             }
-            if (s >= 2) force_arm_all(pid, addrs, 1);
-            live[s] = probe_wait(h, 15, tags[s]);
+            live[s] = probe_watch(h, 15, tags[s], datab, base);
         }
         CloseHandle(h);
     }
@@ -1343,7 +1417,7 @@ static int tool_probe(const char *target_exe, const char *exe_dir) {
     wprint(L"\n===== PROBE SUMMARY =====\n");
     for (s = 0; s < 4; s++)
         wprint(L"  S%d: %s\n", s, !opened[s] ? L"เปิดไม่ติด" : live[s] ? L"รอด" : L"ตาย");
-    wprint(L"[*] ส่งผล 4 บรรทัดนี้มา (ขั้นแรกที่ขึ้นว่า \"ตาย\" = ตัวฆ่า)\n");
+    wprint(L"[*] ส่งผล 4 บรรทัดนี้มา (S2/S3 รอด = ปัญหาคือจังหวะฉีด, S3 รอด S2 ตาย = ปัญหาคือ hijack)\n");
     return 0;
 }
 
@@ -1378,7 +1452,7 @@ int main(int argc, char **argv) {
     }
 
     wprint(L"=================================================\n");
-    wprint(L"     LOGIN KEY PATCHER v2.6 (DIAG BUILD)          \n");
+    wprint(L"     LOGIN KEY PATCHER v2.7 (DIAG BUILD)          \n");
     wprint(L"=================================================\n");
 
     GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir));

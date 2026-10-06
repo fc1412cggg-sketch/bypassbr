@@ -291,6 +291,42 @@ static int sc_trace_veh(uint8_t *out, uint64_t counters_base, uint64_t table_bas
     return s->pos;
 }
 
+/* OBSERVER VEH (v2.7 diagnostic): log EVERY exception into a 32-entry ring,
+ * touch nothing else, always return EXCEPTION_CONTINUE_SEARCH (1).
+ *   datab+0x100 : u64 total seen
+ *   datab+0x200 : 32 x { u32 code, u32 pad, u64 addr } (16 bytes each)
+ * Volatile regs only (rax/rdx/r8/r9) — safe to run in front of Enigma. */
+static int sc_log_veh(uint8_t *out, uint64_t datab) {
+    ScBuf b = { out, 0 }; ScBuf *s = &b;
+    static const uint8_t m1[]  = { 0x48, 0x8B, 0x01 };                     /* mov rax,[rcx]        ; ExceptionRecord */
+    static const uint8_t m2[]  = { 0x44, 0x8B, 0x00 };                     /* mov r8d,[rax]        ; ExceptionCode */
+    static const uint8_t m3[]  = { 0x4C, 0x8B, 0x48, 0x10 };               /* mov r9,[rax+0x10]    ; ExceptionAddress */
+    static const uint8_t m5[]  = { 0x8B, 0x90, 0x00, 0x01, 0x00, 0x00 };   /* mov edx,[rax+0x100]  ; total */
+    static const uint8_t m6[]  = { 0x83, 0xE2, 0x1F };                     /* and edx,31 */
+    static const uint8_t m7[]  = { 0xC1, 0xE2, 0x04 };                     /* shl edx,4 */
+    static const uint8_t m8[]  = { 0x48, 0x8D, 0x94, 0x10,
+                                   0x00, 0x02, 0x00, 0x00 };               /* lea rdx,[rax+rdx+0x200] */
+    static const uint8_t m9[]  = { 0x44, 0x89, 0x02 };                     /* mov [rdx],r8d */
+    static const uint8_t m10[] = { 0x4C, 0x89, 0x4A, 0x08 };               /* mov [rdx+8],r9 */
+    static const uint8_t m11[] = { 0x48, 0xFF, 0x80,
+                                   0x00, 0x01, 0x00, 0x00 };               /* inc qword [rax+0x100] */
+    static const uint8_t m12[] = { 0xB8, 0x01, 0x00, 0x00, 0x00 };         /* mov eax,1 (SEARCH) */
+    SC_PUT(s, m1);
+    SC_PUT(s, m2);
+    SC_PUT(s, m3);
+    SC_PUT(s, B_MOV_RAX); sc_u64(s, datab);
+    SC_PUT(s, m5);
+    SC_PUT(s, m6);
+    SC_PUT(s, m7);
+    SC_PUT(s, m8);
+    SC_PUT(s, m9);
+    SC_PUT(s, m10);
+    SC_PUT(s, m11);
+    SC_PUT(s, m12);
+    sc_u8(s, 0xC3);
+    return s->pos;
+}
+
 /* MSVC std::string (32 bytes). If text > 15 chars, chars (+NUL) go to longbuf
  * and the struct points at longaddr. longbuf must fit strlen(text)+1. */
 static void sc_std_string(uint8_t st[32], const char *text, uint64_t longaddr, uint8_t *longbuf) {
