@@ -422,8 +422,8 @@ static uint64_t remote_add_veh_hijack(HANDLE hProc, DWORD pid, uint64_t handler,
                 ResumeThread(ht); CloseHandle(ht); continue;
             }
             ctx.Rip = (DWORD64)(uintptr_t)addveh;
-            ctx.Rcx = (DWORD64)handler;
-            ctx.Rdx = 1; /* FirstHandler */
+            ctx.Rcx = 1; /* FirstHandler (ULONG) — ต้องเป็นตัวแรก! */
+            ctx.Rdx = (DWORD64)handler;
             ctx.Rsp = (DWORD64)newsp;
             ctx.ContextFlags = CONTEXT_ALL;
             if (!SetThreadContext(ht, &ctx)) {
@@ -474,29 +474,33 @@ static uint64_t remote_add_veh_remote_thread(HANDLE hProc, uint64_t stub, uint64
     return handle;
 }
 
-/* stub: sub rsp,0x28; mov rcx,handler; mov edx,1; mov rax,AddVEH; call rax;
- *       add rsp,0x28; mov [result],rax; ret */
-static int build_rtstub(uint8_t *out, uint64_t handler, uint64_t addveh, uint64_t result) {
+/* stub: sub rsp,0x28; rcx=a1; rdx=a2; r8=a3; r9=a4; call func;
+ *       add rsp,0x28; mov [result],rax; ret
+ * ระวัง: AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
+ *        -> a1 = 1/0, a2 = handler (ลำดับนี้ผิดมาตลอดคือบั๊กที่ทำให้ deef พัง) */
+static int build_rtstub(uint8_t *out, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+                        uint64_t func, uint64_t result) {
     uint8_t *p = out;
-    static const uint8_t a[] = { 0x48, 0x83, 0xEC, 0x28 };
-    static const uint8_t b[] = { 0x48, 0xB9 };
-    static const uint8_t c[] = { 0xBA, 0x01, 0x00, 0x00, 0x00 };
-    static const uint8_t d[] = { 0x48, 0xB8 };
-    static const uint8_t e[] = { 0xFF, 0xD0 };
-    static const uint8_t f[] = { 0x48, 0x83, 0xC4, 0x28 };
-    static const uint8_t g[] = { 0x48, 0xA3 };
-    memcpy(p, a, sizeof(a)); p += sizeof(a);
-    memcpy(p, b, sizeof(b)); p += sizeof(b);
-    memcpy(p, &handler, 8); p += 8;
-    memcpy(p, c, sizeof(c)); p += sizeof(c);
-    memcpy(p, d, sizeof(d)); p += sizeof(d);
-    memcpy(p, &addveh, 8); p += 8;
-    memcpy(p, e, sizeof(e)); p += sizeof(e);
-    memcpy(p, f, sizeof(f)); p += sizeof(f);
-    memcpy(p, g, sizeof(g)); p += sizeof(g);
-    memcpy(p, &result, 8); p += 8;
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0xEC; *p++ = 0x28;
+    *p++ = 0x48; *p++ = 0xB9; memcpy(p, &a1, 8); p += 8;   /* mov rcx, a1 */
+    *p++ = 0x48; *p++ = 0xBA; memcpy(p, &a2, 8); p += 8;   /* mov rdx, a2 */
+    *p++ = 0x49; *p++ = 0xB8; memcpy(p, &a3, 8); p += 8;   /* mov r8,  a3 */
+    *p++ = 0x49; *p++ = 0xB9; memcpy(p, &a4, 8); p += 8;   /* mov r9,  a4 */
+    *p++ = 0x48; *p++ = 0xB8; memcpy(p, &func, 8); p += 8; /* mov rax, func */
+    *p++ = 0xFF; *p++ = 0xD0;                              /* call rax */
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0xC4; *p++ = 0x28;
+    *p++ = 0x48; *p++ = 0xA3; memcpy(p, &result, 8); p += 8; /* mov [result], rax */
     *p++ = 0xC3;
     return (int)(p - out);
+}
+
+/* helper: address of an exported function INSIDE the target process */
+static uint64_t remote_proc(HANDLE h, const char *mod, const char *name) {
+    HMODULE m = GetModuleHandleA(mod);
+    FARPROC f = m ? GetProcAddress(m, name) : NULL;
+    uint64_t base = get_module_base(h, mod);
+    if (!f || !base) return 0;
+    return base + ((uint64_t)(uintptr_t)f - (uint64_t)(uintptr_t)m);
 }
 
 /* ---------------- restore (direct mode leftovers) ---------------- */
@@ -577,7 +581,8 @@ static int do_stealth(HANDLE h, DWORD pid, uint64_t base,
     veh_len = sc_veh_handler(veh, hook, code_addr, counter);
     {
         FARPROC addveh = GetProcAddress(GetModuleHandleA("kernel32.dll"), "AddVectoredExceptionHandler");
-        stub_len = build_rtstub(stub, veh_addr, (uint64_t)(uintptr_t)addveh, datab);
+        stub_len = build_rtstub(stub, 1, veh_addr, 0, 0,
+                             remote_proc(h, "kernel32.dll", "AddVectoredExceptionHandler"), datab);
     }
     /* entry-redirect: show main UI instead of login, return success to caller.
      * key/username only set the displayed identity (login UI never appears). */
@@ -1175,8 +1180,8 @@ static int tool_trace(HANDLE h, DWORD pid, uint64_t base, uint64_t *rvas, int n)
     veh_len = sc_trace_veh(veh, datab, datab + 0x40);
     wpm(h, datab + 0x40, addrs, (SIZE_T)(n * 8)); /* slot->address verify table */
     {
-        FARPROC addveh = GetProcAddress(GetModuleHandleA("kernel32.dll"), "AddVectoredExceptionHandler");
-        stub_len = build_rtstub(stub, veh_addr, (uint64_t)(uintptr_t)addveh, datab + 0x80);
+        stub_len = build_rtstub(stub, 1, veh_addr, 0, 0,
+                             remote_proc(h, "kernel32.dll", "AddVectoredExceptionHandler"), datab + 0x80);
     }
     wpm(h, veh_addr, veh, veh_len);
     {
@@ -1242,14 +1247,30 @@ static void tool_diag(HANDLE h, uint64_t base, uint64_t size) {
     wprint(L"===== END DIAG =====\n");
 }
 
-/* ---- --probe v2.8: แยกว่าอะไรที่ Enigma ดักจับได้ ----
- * ทุกขั้น: เปิด deef ใหม่ → รอหน้าต่าง login โผล่ → ทำ 1 ขั้น → ดู 12 วิ
- *   P0 แค่จอง memory (RW) เฉย ๆ
- *   P1 +เขียนโค้ด +ทำให้เป็น executable (RX) แต่ยังไม่รัน ไม่ลง VEH
- *   P2 +สั่งรันโค้ดใน memory นั้น (CreateRemoteThread) แต่ไม่ลง VEH
- *   P3 +ลง VEH (control — รู้ว่าตาย)
- *   P4 +ลง VEH แต่ handler เขียนไว้ในภาพ deef เอง (อยู่ใน module)
- * ตัวบันทึก: datab+0x100 = นับ exception, datab+0x200 = ring 32 ช่อง */
+/* ---- --probe v2.10: พิสูจน์ว่า VEH ลงถูกต้องแล้ว (แก้ลำดับ argument) ----
+ * พบว่าของเดิมเรียก AddVectoredExceptionHandler(handler, 1) ทั้งที่โปรแกรมจริงคือ
+ *   AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
+ * → แปลว่าเราลงทะเบียน handler ที่ address=1 มาตลอด พอ deef มี exception ปุ๊บ
+ *   มันเรียก address 1 → 0xC0000005 → ตาย (นี่คือ "ตัวฆ่า" ของจริง)
+ * R  : สอดแนม ntdll (อ่านอย่างเดียว) — เช็คว่ามี inline hook มั้ย
+ * P0 : ลง VEH ด้วยลำดับที่ถูก + ยิง exception ทดสอบ (0xDEADBEEF) เพื่อพิสูจน์ว่า handler ทำงาน
+ * P1 : ติดตั้งจริง (arm 0x214370 + entry-redirect) แล้วดูว่า deef รอด + แตกกี่ครั้ง */
+
+static const char *HOOK_NAMES[] = {
+    "RtlAddVectoredExceptionHandler", "RtlRemoveVectoredExceptionHandler",
+    "RtlDispatchException", "KiUserExceptionDispatcher",
+    "RtlEncodePointer", "RtlDecodePointer",
+    "NtSetContextThread", "NtGetContextThread", "NtContinue",
+    "NtProtectVirtualMemory", "NtWriteVirtualMemory", "NtReadVirtualMemory",
+    "NtQueryInformationProcess", "NtSetInformationProcess",
+    "NtCreateThreadEx", "NtSuspendThread", "NtResumeThread",
+    "NtTerminateProcess", "RtlExitUserProcess", "LdrLoadDll",
+    "NtWaitForSingleObject", "NtDelayExecution", "NtQuerySystemInformation",
+    "NtQueueApcThread", "NtRaiseException", "RtlUserThreadStart",
+    "NtSetInformationThread", "NtQueryVirtualMemory", "NtAllocateVirtualMemory",
+    "NtFreeVirtualMemory", "NtGetTickCount", NULL
+};
+
 typedef struct { uint64_t code; uint64_t addr; } ExcEnt;
 
 static uint64_t probe_alloc2(HANDLE h, uint64_t *out_mem, uint64_t *out_datab) {
@@ -1264,88 +1285,52 @@ static uint64_t probe_alloc2(HANDLE h, uint64_t *out_mem, uint64_t *out_datab) {
     return 1;
 }
 
-/* หาที่ว่างท้าย section ที่ execute ได้ (อยู่ในภาพ deef → ผ่าน check "handler ต้องอยู่ใน module") */
-static int find_code_slack(HANDLE h, uint64_t base, uint64_t *out_addr, uint64_t *out_len) {
-    uint8_t hdr[4096];
-    uint32_t lf = 0, nsec = 0, optsz = 0, sect = 0;
-    uint64_t align = 0x1000;
-    uint32_t i;
-    uint64_t best_addr = 0, best_len = 0;
-    if (!rpm(h, base, hdr, 1024)) return 0;
-    memcpy(&lf, hdr + 0x3C, 4);
-    if (lf == 0 || lf > 0x800) return 0;
-    if (memcmp(hdr + lf, "PE\0\0", 4) != 0) return 0;
-    memcpy(&nsec, hdr + lf + 6, 4);
-    memcpy(&optsz, hdr + lf + 20, 4);
-    sect = lf + 24 + optsz;
-    if (nsec == 0 || nsec > 32) return 0;
-    {
-        uint16_t m = 0;
-        memcpy(&m, hdr + lf + 4, 2);
-        if (m != 0x8664) return 0;
-    }
-    for (i = 0; i < nsec; i++) {
-        uint8_t *sh = hdr + sect + i * 40;
-        uint32_t vsize = 0, vaddr = 0, chars = 0;
-        uint64_t mapped, slack, start;
-        memcpy(&vsize, sh + 8, 4);
-        memcpy(&vaddr, sh + 12, 4);
-        memcpy(&chars, sh + 36, 4);
-        if (!(chars & 0x20000000)) continue; /* MEM_EXECUTE */
-        if (!vsize || !vaddr) continue;
-        mapped = ((uint64_t)vsize + align - 1) & ~(align - 1);
-        if (mapped <= vsize) continue;
-        slack = mapped - vsize;
-        start = ((uint64_t)vaddr + vsize + 15) & ~15ULL;
-        slack = mapped - (start - vaddr);
-        if (slack < 64) continue;
-        if (slack > best_len) { best_len = slack; best_addr = base + start; }
-    }
-    if (!best_addr) return 0;
-    *out_addr = best_addr;
-    *out_len = best_len;
-    return 1;
+/* ลง VEH แบบถูกต้อง: AddVectoredExceptionHandler(1, handler) */
+static uint64_t install_veh(HANDLE h, uint64_t handler, uint64_t mem, uint64_t datab) {
+    uint8_t stub[128];
+    uint8_t doneb[2] = { 0xEB, 0xFE };
+    uint64_t addveh = remote_proc(h, "kernel32.dll", "AddVectoredExceptionHandler");
+    uint64_t vh = 0;
+    int n;
+    DWORD old = 0;
+    HANDLE rt;
+    if (!addveh) { wprint(L"[!]   หา AddVectoredExceptionHandler ใน deef ไม่เจอ\n"); return 0; }
+    n = build_rtstub(stub, 1, handler, 0, 0, addveh, datab + 0x80);
+    wpm(h, mem + L_RTSTUB, stub, (SIZE_T)n);
+    wpm(h, mem + L_DONE, doneb, 2);
+    VirtualProtectEx(h, (LPVOID)(uintptr_t)mem, 4096, PAGE_EXECUTE_READ, &old);
+    rt = CreateRemoteThread(h, NULL, 0, (LPTHREAD_START_ROUTINE)(uintptr_t)(mem + L_RTSTUB), NULL, 0, NULL);
+    if (rt) { WaitForSingleObject(rt, 5000); CloseHandle(rt); }
+    rpm(h, datab + 0x80, &vh, 8);
+    if (vh) wprint(L"[+]   ลง VEH สำเร็จ handle=0x%llX (เรียกแบบ AddVectoredExceptionHandler(1, handler))\n",
+                   (unsigned long long)vh);
+    else wprint(L"[!]   ลง VEH ไม่สำเร็จ (handle=0)\n");
+    return vh;
 }
 
-static uint64_t probe_addveh(HANDLE h, DWORD pid, uint64_t handler, int use_rt) {
-    uint64_t mem = 0, datab = 0, vh = 0;
-    uint8_t stub[64];
-    int stub_len;
-    if (!probe_alloc2(h, &mem, &datab)) return 0;
-    {
-        FARPROC addveh = GetProcAddress(GetModuleHandleA("kernel32.dll"), "AddVectoredExceptionHandler");
-        stub_len = build_rtstub(stub, handler, (uint64_t)(uintptr_t)addveh, datab + 0x80);
-    }
-    {
-        uint8_t doneb[2] = { 0xEB, 0xFE };
-        DWORD old = 0;
-        wpm(h, mem + L_RTSTUB, stub, (SIZE_T)stub_len);
-        wpm(h, mem + L_DONE, doneb, 2);
-        VirtualProtectEx(h, (LPVOID)(uintptr_t)mem, 4096, PAGE_EXECUTE_READ, &old);
-    }
-    if (use_rt) {
-        vh = remote_add_veh_remote_thread(h, mem + L_RTSTUB, datab + 0x80);
-        if (vh) wprint(L"[*]   VEH via CreateRemoteThread handle=0x%llX\n", (unsigned long long)vh);
-    } else {
-        vh = remote_add_veh_hijack(h, pid, handler, mem + L_DONE);
-        if (vh) wprint(L"[*]   VEH via hijack handle=0x%llX\n", (unsigned long long)vh);
-        else {
-            vh = remote_add_veh_remote_thread(h, mem + L_RTSTUB, datab + 0x80);
-            if (vh) wprint(L"[*]   VEH via CreateRemoteThread handle=0x%llX\n", (unsigned long long)vh);
-        }
-    }
-    return vh;
+/* ยิง exception 0xDEADBEEF ใน deef เพื่อพิสูจน์ว่า handler เราทำงานจริง */
+static void selftest_veh(HANDLE h, uint64_t mem, uint64_t datab) {
+    uint8_t stub[128];
+    uint64_t raise = remote_proc(h, "kernel32.dll", "RaiseException");
+    int n;
+    HANDLE rt;
+    if (!raise) { wprint(L"[!]   หา RaiseException ไม่เจอ\n"); return; }
+    n = build_rtstub(stub, 0xDEADBEEF, 0, 0, 0, raise, datab + 0x80);
+    wpm(h, mem + L_RTSTUB, stub, (SIZE_T)n);
+    rt = CreateRemoteThread(h, NULL, 0, (LPTHREAD_START_ROUTINE)(uintptr_t)(mem + L_RTSTUB), NULL, 0, NULL);
+    if (rt) { WaitForSingleObject(rt, 5000); CloseHandle(rt); }
+    wprint(L"[*]   ยิง exception ทดสอบ 0xDEADBEEF แล้ว\n");
 }
 
 static void dump_exc_log(uint64_t total, ExcEnt *ring, uint64_t base) {
     int k, newest;
     wprint(L"[*]   exception log: เห็นทั้งหมด %llu ครั้ง\n", (unsigned long long)total);
     if (!total) {
-        wprint(L"[*]   ไม่มี exception เลย → deef โดนปิดเอง/โดนฆ่า (ไม่ใช่ crash)\n");
+        wprint(L"[*]   ไม่มี exception เลย → handler ไม่ได้ถูกเรียก (หรือ deef ไม่มี exception)\n");
         return;
     }
     newest = (int)((total - 1) & 31);
-    for (k = 2; k >= 0; k--) {
+    for (k = 4; k >= 0; k--) {
         int idx = (newest - k + 32) & 31;
         if (total < (uint64_t)(k + 1)) continue;
         wprint(L"      #%llu code=0x%08X addr=0x%llX",
@@ -1377,8 +1362,8 @@ static int probe_watch(HANDLE h, int secs, const wchar_t *tag, uint64_t datab, u
             return 0;
         }
     }
-    wprint(L"[LIVE] %s: รอดครบ %d วินาที%s\n", tag, secs,
-           datab ? L"" : L"");
+    wprint(L"[LIVE] %s: รอดครบ %d วินาที\n", tag, secs);
+    if (datab) dump_exc_log(total, ring, base);
     return 1;
 }
 
@@ -1396,134 +1381,152 @@ static BOOL CALLBACK enum_win_cb(HWND hw, LPARAM lp) {
     w->hwnd = hw;
     return FALSE;
 }
-static int wait_window(DWORD pid, int max_secs) {
+static void wait_window(DWORD pid, int max_secs) {
     int i;
     for (i = 0; i < max_secs * 4; i++) {
         struct WinFind w;
         char title[256];
+        wchar_t wt[256];
         w.pid = pid; w.hwnd = NULL;
         Sleep(250);
         EnumWindows(enum_win_cb, (LPARAM)&w);
         if (w.hwnd) {
-            wchar_t wt[256];
             title[0] = 0;
             GetWindowTextA(w.hwnd, title, sizeof(title));
             towide(title, wt, 256);
             wprint(L"[+]   เห็นหน้าต่างแล้ว (~%.1f วิ): \"%s\"\n", (i + 1) * 0.25, wt);
-            return 1;
+            return;
         }
     }
     wprint(L"[!]   รอหน้าต่างครบ %d วิแล้วยังไม่โผล่\n", max_secs);
-    return 0;
+}
+
+static void recon(HANDLE h, uint64_t base) {
+    HMODULE our_ntdll = GetModuleHandleA("ntdll.dll");
+    uint64_t onb = (uint64_t)(uintptr_t)our_ntdll;
+    uint64_t tnb = get_module_base(h, "ntdll.dll");
+    int i;
+    (void)base;
+    wprint(L"\n----- RECON (อ่านอย่างเดียว) -----\n");
+    if (!tnb) { wprint(L"[!] หา ntdll ใน deef ไม่เจอ\n"); return; }
+    wprint(L"[*] ntdll: เรา=0x%llX deef=0x%llX %s\n", (unsigned long long)onb,
+           (unsigned long long)tnb, onb == tnb ? L"(base เดียวกัน)" : L"(base ไม่ตรงกัน)");
+    for (i = 0; HOOK_NAMES[i]; i++) {
+        uint8_t ours[16], theirs[16];
+        FARPROC f = GetProcAddress(our_ntdll, HOOK_NAMES[i]);
+        uint64_t rva;
+        int k;
+        if (!f) continue;
+        rva = (uint64_t)(uintptr_t)f - onb;
+        memset(ours, 0, 16); memset(theirs, 0, 16);
+        memcpy(ours, f, 16);
+        if (!rpm(h, tnb + rva, theirs, 16)) continue;
+        if (memcmp(ours, theirs, 16) == 0) continue;
+        wprint(L"    [HOOKED] %S\n", HOOK_NAMES[i]);
+        wprint(L"        เรา  : ");
+        for (k = 0; k < 16; k++) wprint(L"%02X ", ours[k]);
+        wprint(L"\n        deef : ");
+        for (k = 0; k < 16; k++) wprint(L"%02X ", theirs[k]);
+        wprint(L"\n");
+    }
+    wprint(L"[*] จบการเทียบ ntdll (ที่ไม่ขึ้น = เหมือนกันทุกไบต์ = ไม่มี hook)\n");
+    wprint(L"----- จบ RECON -----\n\n");
 }
 
 static int tool_probe(const char *target_exe, const char *exe_dir) {
-    int live[5] = { 0, 0, 0, 0, 0 };
-    int opened[5] = { 0, 0, 0, 0, 0 };
+    int live[3] = { 0, 0, 0 };
+    int opened[3] = { 0, 0, 0 };
     int s;
-    static const wchar_t *tags[5] = {
-        L"P0 จอง memory (RW) เฉย ๆ",
-        L"P1 +เขียนโค้ด +ตั้งเป็น RX (ยังไม่รัน)",
-        L"P2 +สั่งรันโค้ดนอกภาพ (CreateRemoteThread)",
-        L"P3 +ลง VEH แบบปกติ (control)",
-        L"P4 +ลง VEH แต่ handler อยู่ในภาพ deef"
+    static const wchar_t *tags[3] = {
+        L"R  สอดแนม ntdll (อ่านอย่างเดียว)",
+        L"P0 ลง VEH (ลำดับถูก) + ยิง exception ทดสอบ",
+        L"P1 ติดตั้งจริง arm 0x214370 + entry-redirect"
     };
-    wprint(L"[*] probe v2.8: แยกว่าอะไรที่ Enigma จับได้ (5 รอบ x ~25 วิ)\n");
-    for (s = 0; s < 5; s++) {
+    wprint(L"[*] probe v2.10: พิสูจน์ว่า VEH ทำงาน + ทดสอบทางผ่านจริง (3 รอบ)\n");
+    for (s = 0; s < 3; s++) {
         DWORD pid = 0;
         HANDLE h = NULL;
         uint64_t base = 0;
         kill_deef();
-        wprint(L"\n===== PROBE %d/5 =====\n", s);
+        wprint(L"\n===== PROBE %d/3 =====\n", s);
         if (!open_target(target_exe, exe_dir, &pid, &h, &base)) {
-            wprint(L"[DIED] P%d: เปิด/wait ไม่ผ่านตั้งแต่ต้น\n", s);
+            wprint(L"[DIED] ขั้น %d: เปิด/wait ไม่ผ่านตั้งแต่ต้น\n", s);
             continue;
         }
         opened[s] = 1;
         wait_window(pid, 45);
         if (s == 0) {
-            uint64_t mem = 0, datab = 0;
-            if (!probe_alloc2(h, &mem, &datab)) { CloseHandle(h); continue; }
-            wprint(L"[*]   จอง RW 2x4096 @0x%llX (ไม่เขียน ไม่รัน)\n", (unsigned long long)mem);
-            live[s] = probe_watch(h, 12, tags[s], 0, base);
+            recon(h, base);
+            live[s] = probe_watch(h, 8, tags[s], 0, base);
         } else if (s == 1) {
-            uint64_t mem = 0, datab = 0;
-            uint8_t veh[128];
-            int n;
-            DWORD old = 0;
-            if (!probe_alloc2(h, &mem, &datab)) { CloseHandle(h); continue; }
-            n = sc_log_veh(veh, datab);
-            wpm(h, mem + L_VEH, veh, (SIZE_T)n);
-            VirtualProtectEx(h, (LPVOID)(uintptr_t)mem, 4096, PAGE_EXECUTE_READ, &old);
-            wprint(L"[*]   เขียน handler %d ไบต์ + ตั้งเป็น PAGE_EXECUTE_READ (ยังไม่รัน ไม่ลง VEH)\n", n);
-            live[s] = probe_watch(h, 12, tags[s], 0, base);
-        } else if (s == 2) {
-            uint64_t mem = 0, datab = 0;
-            uint8_t stub[32];
-            uint8_t *p = stub;
-            uint64_t marker = 0;
-            int n;
-            DWORD old = 0;
-            HANDLE rt;
-            if (!probe_alloc2(h, &mem, &datab)) { CloseHandle(h); continue; }
-            *p++ = 0x48; *p++ = 0xB8; { uint64_t a = datab + 0x80; memcpy(p, &a, 8); p += 8; }
-            *p++ = 0x48; *p++ = 0xC7; *p++ = 0x00;
-            *p++ = 0xEF; *p++ = 0xBE; *p++ = 0xAD; *p++ = 0xDE;
-            *p++ = 0xC3;
-            n = (int)(p - stub);
-            wpm(h, mem + L_VEH, stub, (SIZE_T)n);
-            VirtualProtectEx(h, (LPVOID)(uintptr_t)mem, 4096, PAGE_EXECUTE_READ, &old);
-            rt = CreateRemoteThread(h, NULL, 0, (LPTHREAD_START_ROUTINE)(uintptr_t)(mem + L_VEH), NULL, 0, NULL);
-            if (rt) { WaitForSingleObject(rt, 5000); CloseHandle(rt); }
-            rpm(h, datab + 0x80, &marker, 8);
-            wprint(L"[*]   รันโค้ดนอกภาพสำเร็จ? marker=0x%llX (ต้องเป็น 0xDEADBEEF)\n",
-                   (unsigned long long)marker);
-            live[s] = probe_watch(h, 12, tags[s], 0, base);
-        } else if (s == 3) {
             uint64_t mem = 0, datab = 0, vh;
             uint8_t veh[128];
             int n;
             DWORD old = 0;
             if (!probe_alloc2(h, &mem, &datab)) { CloseHandle(h); continue; }
-            n = sc_log_veh(veh, datab);
+            n = sc_test_veh(veh, datab);
             wpm(h, mem + L_VEH, veh, (SIZE_T)n);
-            VirtualProtectEx(h, (LPVOID)(uintptr_t)mem, 4096, PAGE_EXECUTE_READ, &old);
-            vh = probe_addveh(h, pid, mem + L_VEH, 1);
-            if (!vh) { wprint(L"[DIED] P3: ลง VEH ไม่สำเร็จ\n"); CloseHandle(h); continue; }
+            vh = install_veh(h, mem + L_VEH, mem, datab);
+            if (!vh) { CloseHandle(h); continue; }
+            selftest_veh(h, mem, datab);
             live[s] = probe_watch(h, 12, tags[s], datab, base);
         } else {
             uint64_t mem = 0, datab = 0, vh;
-            uint64_t slack = 0, slen = 0;
-            uint8_t veh[128];
-            int n;
+            uint64_t hook = base + RVA_LOGIN_SCREEN;
+            uint64_t main_screen = base + RVA_MAIN_SCREEN;
+            uint64_t code_addr, user_str, key_str, user_lng, key_lng, counter;
+            uint8_t veh[128], code[512], st[32], longbuf[256];
+            int n, armed;
             DWORD old = 0;
             if (!probe_alloc2(h, &mem, &datab)) { CloseHandle(h); continue; }
-            if (!find_code_slack(h, base, &slack, &slen)) {
-                wprint(L"[!]   P4: หาที่ว่างในภาพไม่เจอ\n");
-                CloseHandle(h);
-                continue;
+            code_addr = mem + L_CODE; user_str = mem + L_USER_STR; key_str = mem + L_KEY_STR;
+            user_lng = mem + L_USER_LONG; key_lng = mem + L_KEY_LONG;
+            counter = datab + 0x100;
+            n = sc_veh_handler(veh, hook, code_addr, counter);
+            wpm(h, mem + L_VEH, veh, (SIZE_T)n);
+            n = sc_build_entry(code, main_screen, user_str, key_str);
+            wpm(h, code_addr, code, (SIZE_T)n);
+            sc_std_string(st, "VIP User", user_lng, longbuf);
+            wpm(h, user_str, st, 32);
+            sc_std_string(st, "ARENA-2026-FREE", key_lng, longbuf);
+            wpm(h, key_str, st, 32);
+            VirtualProtectEx(h, (LPVOID)(uintptr_t)mem, 4096, PAGE_EXECUTE_READ, &old);
+            wprint(L"[*]   ติดตั้งจริง: hook=0x%llX shellcode=%d ไบต์\n",
+                   (unsigned long long)hook, n);
+            vh = install_veh(h, mem + L_VEH, mem, datab);
+            if (!vh) { CloseHandle(h); continue; }
+            armed = arm_threads(pid, hook, 0);
+            wprint(L"[*]   ใส่ hardware breakpoint แล้ว %d threads\n", armed);
+            {
+                int i;
+                uint64_t hits = 0, shown = 0;
+                for (i = 0; i < 200; i++) {
+                    Sleep(100);
+                    if (!target_alive(h)) {
+                        wprint(L"[DIED] %s: ตายหลัง ~%.1f วินาที! ", tags[s], (i + 1) * 0.1);
+                        report_exit(h);
+                        break;
+                    }
+                    if (rpm(h, counter, &hits, 8) && hits != shown) {
+                        wprint(L"[HIT] จุด login แตกแล้ว รวม %llu ครั้ง\n", (unsigned long long)hits);
+                        shown = hits;
+                    }
+                }
+                if (target_alive(h)) {
+                    live[s] = 1;
+                    wprint(L"[LIVE] %s: รอดครบ 20 วินาที (แตก %llu ครั้ง)\n", tags[s],
+                           (unsigned long long)hits);
+                }
             }
-            n = sc_log_veh(veh, datab);
-            VirtualProtectEx(h, (LPVOID)(uintptr_t)(slack & ~0xFFFULL), 4096, PAGE_EXECUTE_READWRITE, &old);
-            if (!wpm(h, slack, veh, (SIZE_T)n)) {
-                wprint(L"[!]   P4: เขียน handler ลงภาพไม่ได้ err=%lu\n", GetLastError());
-                CloseHandle(h);
-                continue;
-            }
-            VirtualProtectEx(h, (LPVOID)(uintptr_t)(slack & ~0xFFFULL), 4096, old, &old);
-            wprint(L"[*]   handler %d ไบต์ อยู่ในภาพที่ deef+0x%llX (ที่ว่าง %llu ไบต์)\n",
-                   n, (unsigned long long)(slack - base), (unsigned long long)slen);
-            vh = probe_addveh(h, pid, slack, 1);
-            if (!vh) { wprint(L"[DIED] P4: ลง VEH ไม่สำเร็จ\n"); CloseHandle(h); continue; }
-            live[s] = probe_watch(h, 12, tags[s], datab, base);
         }
         CloseHandle(h);
     }
     kill_deef();
     wprint(L"\n===== PROBE SUMMARY =====\n");
-    for (s = 0; s < 5; s++)
-        wprint(L"  P%d: %s\n", s, !opened[s] ? L"เปิดไม่ติด" : live[s] ? L"รอด" : L"ตาย");
-    wprint(L"[*] ส่งผล 5 บรรทัดนี้มา (P0-P2 รอด P3 ตาย = Enigma จับการลง VEH ได้; P4 รอด = ต้องเอา handler ไว้ในภาพ)\n");
+    for (s = 0; s < 3; s++)
+        wprint(L"  %s: %s\n", s == 0 ? L"R " : (s == 1 ? L"P0" : L"P1"),
+               !opened[s] ? L"เปิดไม่ติด" : live[s] ? L"รอด" : L"ตาย");
+    wprint(L"[*] ถ้า P0 รอดและ log มี 0xDEADBEEF = VEH ทำงานจริง; ถ้า P1 รอดและมี HIT = ทะลุ login แล้ว\n");
     return 0;
 }
 
@@ -1558,7 +1561,7 @@ int main(int argc, char **argv) {
     }
 
     wprint(L"=================================================\n");
-    wprint(L"     LOGIN KEY PATCHER v2.8 (DIAG BUILD)          \n");
+    wprint(L"     LOGIN KEY PATCHER v2.10 (ARG-FIX)          \n");
     wprint(L"=================================================\n");
 
     GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir));

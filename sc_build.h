@@ -327,6 +327,21 @@ static int sc_log_veh(uint8_t *out, uint64_t datab) {
     return s->pos;
 }
 
+/* SELF-TEST VEH: เหมือน sc_log_veh ทุกประการ แต่ถ้า ExceptionCode == 0xDEADBEEF
+ * (exception ที่เรายิงเองเพื่อทดสอบ) จะคืน EXCEPTION_CONTINUE_EXECUTION (0)
+ * เพื่อให้ thread ทดสอบรอดกลับมาได้ — พิสูจน์ว่า handler ถูกติดตั้งจริงและทำงานจริง */
+static int sc_test_veh(uint8_t *out, uint64_t datab) {
+    int n = sc_log_veh(out, datab);
+    uint8_t *p = out + n - 6; /* แทรกก่อน mov eax,1 ; ret */
+    static const uint8_t cmp[] = { 0x41, 0x81, 0xF8, 0xEF, 0xBE, 0xAD, 0xDE }; /* cmp r8d,0xDEADBEEF */
+    static const uint8_t jm[]  = { 0x75, 0x03 };                               /* jne +3 */
+    static const uint8_t z[]   = { 0x31, 0xC0, 0xC3 };                         /* xor eax,eax; ret */
+    memcpy(p, cmp, sizeof(cmp)); p += sizeof(cmp);
+    memcpy(p, jm, sizeof(jm)); p += sizeof(jm);
+    memcpy(p, z, sizeof(z)); p += sizeof(z);
+    return (int)(p - out);
+}
+
 /* MSVC std::string (32 bytes). If text > 15 chars, chars (+NUL) go to longbuf
  * and the struct points at longaddr. longbuf must fit strlen(text)+1. */
 static void sc_std_string(uint8_t st[32], const char *text, uint64_t longaddr, uint8_t *longbuf) {
