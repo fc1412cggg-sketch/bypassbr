@@ -165,6 +165,7 @@ static int sc_build_custom(uint8_t *out, uint64_t login_screen, uint64_t main_sc
  *     p->ExceptionRecord->ExceptionAddress == hook_addr) {
  *     p->ContextRecord->Dr6 = 0;
  *     p->ContextRecord->Rip = shell_addr;
+ *     (*counter_addr)++;   // diagnostics: loader polls this (RW data block)
  *     return EXCEPTION_CONTINUE_EXECUTION; // 0
  * }
  * return EXCEPTION_CONTINUE_SEARCH; // 1
@@ -173,7 +174,7 @@ static int sc_build_custom(uint8_t *out, uint64_t login_screen, uint64_t main_sc
  *   EXCEPTION_POINTERS: Record@0x00, Context@0x08
  *   CONTEXT: Dr6@0x68, Rip@0xF8
  */
-static int sc_veh_handler(uint8_t *out, uint64_t hook_addr, uint64_t shell_addr) {
+static int sc_veh_handler(uint8_t *out, uint64_t hook_addr, uint64_t shell_addr, uint64_t counter_addr) {
     ScBuf b = { out, 0 }; ScBuf *s = &b;
     static const uint8_t m1[] = { 0x48, 0x8B, 0x01 };                 /* mov rax, [rcx] */
     static const uint8_t m2[] = { 0x81, 0x38, 0x04, 0x00, 0x00, 0x80 }; /* cmp dword [rax], 0x80000004 */
@@ -193,6 +194,9 @@ static int sc_veh_handler(uint8_t *out, uint64_t hook_addr, uint64_t shell_addr)
     SC_PUT(s, m6);
     SC_PUT(s, B_MOV_R11); sc_u64(s, shell_addr);
     SC_PUT(s, m7);
+    { static const uint8_t m9[] = { 0x48, 0xB8 }; SC_PUT(s, m9); } /* mov rax, counter */
+    sc_u64(s, counter_addr);
+    { static const uint8_t m10[] = { 0x48, 0xFF, 0x00 }; SC_PUT(s, m10); } /* inc qword [rax] */
     sc_u8(s, 0x31); sc_u8(s, 0xC0); /* xor eax, eax (CONTINUE_EXECUTION) */
     sc_u8(s, 0xC3);                /* ret */
     int search = s->pos;

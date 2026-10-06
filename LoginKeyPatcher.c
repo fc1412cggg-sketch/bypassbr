@@ -65,8 +65,9 @@ _Static_assert(offsetof(EXCEPTION_POINTERS, ContextRecord) == 8, "EP.CR");
 #define L_USER_LONG  0x3C0
 #define L_KEY_LONG   0x400
 
-/* ---------------- console output (Unicode-safe) ---------------- */
+/* ---------------- console output (Unicode-safe) + log file ---------------- */
 static HANDLE g_out;
+static FILE *g_log = NULL;
 
 static void wprint(const wchar_t *fmt, ...) {
     wchar_t buf[2048];
@@ -78,6 +79,10 @@ static void wprint(const wchar_t *fmt, ...) {
     DWORD w = 0;
     if (!WriteConsoleW(g_out, buf, (DWORD)wcslen(buf), &w, NULL))
         wprintf(L"%s", buf);
+    if (g_log) {
+        fwprintf(g_log, L"%s", buf);
+        fflush(g_log);
+    }
 }
 
 static void towide(const char *s, wchar_t *d, int n) {
@@ -156,6 +161,33 @@ static int target_alive(HANDLE h) {
     return GetExitCodeProcess(h, &ec) && ec == STILL_ACTIVE;
 }
 
+/* identify the exact target build (file size + PE TimeDateStamp) */
+static void print_target_identity(const char *path) {
+    FILE *f = fopen(path, "rb");
+    uint8_t hdr[512];
+    size_t n;
+    long sz;
+    uint32_t ts = 0;
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    n = fread(hdr, 1, sizeof(hdr), f);
+    fclose(f);
+    if (n >= 0x40 && hdr[0] == 'M' && hdr[1] == 'Z') {
+        uint32_t peo;
+        memcpy(&peo, hdr + 0x3C, 4);
+        if (peo + 8 < n) memcpy(&ts, hdr + peo + 8, 4);
+    }
+    wprint(L"[*] deef.exe size=%ld bytes TimeDateStamp=0x%08X\n", sz, ts);
+}
+
+static void print_hex(const wchar_t *label, uint8_t *b, int n) {
+    int i;
+    wprint(L"%s", label);
+    for (i = 0; i < n; i++) wprint(L"%02X%s", b[i], i + 1 < n ? L" " : L"\n");
+}
+
 /* ---------------- hardware breakpoints ---------------- */
 static HANDLE open_thread_full(DWORD tid) {
     return OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
@@ -228,6 +260,40 @@ static int arm_threads(DWORD pid, uint64_t addr, int only_new) {
             if (arm_hwbp_on_thread(ht, addr) >= 0) n++;
             CloseHandle(ht);
             mark_seen(te.th32ThreadID);
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+    return n;
+}
+
+/* read-only check: how many threads currently have our HWBP armed */
+static int count_armed(DWORD pid, uint64_t addr) {
+    int n = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    THREADENTRY32 te;
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    te.dwSize = sizeof(te);
+    if (Thread32First(snap, &te)) {
+        do {
+            HANDLE ht;
+            CONTEXT ctx;
+            int s;
+            if (te.th32OwnerProcessID != pid) continue;
+            ht = open_thread_full(te.th32ThreadID);
+            if (!ht) continue;
+            if (SuspendThread(ht) != (DWORD)-1) {
+                uint64_t dr[4];
+                memset(&ctx, 0, sizeof(ctx));
+                ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                if (GetThreadContext(ht, &ctx)) {
+                    dr[0] = ctx.Dr0; dr[1] = ctx.Dr1; dr[2] = ctx.Dr2; dr[3] = ctx.Dr3;
+                    for (s = 0; s < 4; s++) {
+                        if (dr[s] == addr && ((ctx.Dr7 >> (2 * s)) & 3)) { n++; break; }
+                    }
+                }
+                ResumeThread(ht);
+            }
+            CloseHandle(ht);
         } while (Thread32Next(snap, &te));
     }
     CloseHandle(snap);
@@ -387,7 +453,7 @@ static int do_stealth(HANDLE h, DWORD pid, uint64_t base,
     uint64_t main_screen = base + RVA_MAIN_SCREEN;
     uint8_t orig[HOOK_LEN];
     int i;
-    uint64_t mem, datab;
+    uint64_t mem, datab, counter;
     uint64_t veh_addr, done_addr, stub_addr, code_addr;
     uint64_t user_str, key_str, expect, user_lng, key_lng;
     uint8_t code[512], veh[128], stub[64], st[32], longbuf[256];
@@ -418,13 +484,14 @@ static int do_stealth(HANDLE h, DWORD pid, uint64_t base,
         wprint(L"[!] VirtualAllocEx ล้มเหลว err=%lu\n", GetLastError());
         return 1;
     }
+    counter = datab + 0x100;
     veh_addr = mem + L_VEH; done_addr = mem + L_DONE; stub_addr = mem + L_RTSTUB;
     code_addr = mem + L_CODE;
     user_str = mem + L_USER_STR; key_str = mem + L_KEY_STR; expect = mem + L_EXPECT;
     user_lng = mem + L_USER_LONG; key_lng = mem + L_KEY_LONG;
 
     /* build everything locally first */
-    veh_len = sc_veh_handler(veh, hook, code_addr);
+    veh_len = sc_veh_handler(veh, hook, code_addr, counter);
     {
         FARPROC addveh = GetProcAddress(GetModuleHandleA("kernel32.dll"), "AddVectoredExceptionHandler");
         stub_len = build_rtstub(stub, veh_addr, (uint64_t)(uintptr_t)addveh, datab);
@@ -484,6 +551,41 @@ static int do_stealth(HANDLE h, DWORD pid, uint64_t base,
         return 1;
     }
     wprint(L"[+] ใส่ hardware breakpoint แล้ว %d threads (slot ว่าง, ไม่ทับของเดิม)\n", armed);
+    wprint(L"[*] hook=0x%llX cont=0x%llX\n", (unsigned long long)hook, (unsigned long long)cont);
+    /* verify: read back debug regs from one thread + dump memory context */
+    {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        THREADENTRY32 te;
+        te.dwSize = sizeof(te);
+        if (snap != INVALID_HANDLE_VALUE && Thread32First(snap, &te)) {
+            do {
+                if (te.th32OwnerProcessID != pid) continue;
+                {
+                    HANDLE ht = open_thread_full(te.th32ThreadID);
+                    if (ht && SuspendThread(ht) != (DWORD)-1) {
+                        CONTEXT ctx;
+                        memset(&ctx, 0, sizeof(ctx));
+                        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                        if (GetThreadContext(ht, &ctx)) {
+                            wprint(L"[*] DR verify: Dr0=%llX Dr1=%llX Dr2=%llX Dr3=%llX Dr7=%llX\n",
+                                   (unsigned long long)ctx.Dr0, (unsigned long long)ctx.Dr1,
+                                   (unsigned long long)ctx.Dr2, (unsigned long long)ctx.Dr3,
+                                   (unsigned long long)ctx.Dr7);
+                        }
+                        ResumeThread(ht);
+                    }
+                    if (ht) CloseHandle(ht);
+                }
+                break;
+            } while (Thread32Next(snap, &te));
+        }
+        if (snap != INVALID_HANDLE_VALUE) CloseHandle(snap);
+    }
+    {
+        uint8_t dump[32];
+        if (rpm(h, base + RVA_WRAPPER, dump, 32)) print_hex(L"[*] wrapper @0x21A0B0: ", dump, 32);
+        if (rpm(h, hook, dump, 32)) print_hex(L"[*] hook @0x21A0B9 (+32): ", dump, 32);
+    }
 
     wprint(L"\n[OK] STEALTH PATCH สำเร็จ! (ไม่ได้แก้โค้ด deef.exe เลย)\n");
     if (strcmp(mode, "any") == 0) wprint(L"[OK] กรอก key อะไรก็ได้ (ห้ามว่าง) -> เข้าหน้าหลักทันที\n");
@@ -495,15 +597,34 @@ static int do_stealth(HANDLE h, DWORD pid, uint64_t base,
     }
     wprint(L"[*] ห้ามปิดหน้าต่างนี้ — loader ต้องค้างไว้เลี้ยง breakpoint (กด Ctrl+C เพื่อปิด)\n");
 
-    /* watchdog: arm new threads every 1s, full re-arm every 10s */
+    /* watchdog (500ms): poll hit counter, arm new threads, re-arm + wipe check */
     {
-        int tick = 0;
+        int tick = 0, last_armed = armed;
+        uint64_t last_hits = 0, shown_hits = 0;
         for (;;) {
-            Sleep(1000);
+            uint64_t hits = 0;
+            Sleep(500);
             if (!target_alive(h)) break;
+            rpm(h, counter, &hits, 8);
+            if (hits != shown_hits && (hits <= 20 || tick % 4 == 0)) {
+                wprint(L"[HIT] hook แตกแล้ว! รวม %llu ครั้ง\n", (unsigned long long)hits);
+                shown_hits = hits;
+            }
+            last_hits = hits;
             arm_threads(pid, hook, 1);
-            if (++tick % 10 == 0) arm_threads(pid, hook, 0);
+            if (++tick % 4 == 0) {
+                int cur = count_armed(pid, hook);
+                if (cur == 0 && last_armed > 0)
+                    wprint(L"[!] breakpoint โดนล้าง (Enigma?) — ใส่ใหม่...\n");
+                arm_threads(pid, hook, 0);
+                last_armed = count_armed(pid, hook);
+            }
         }
+        if (last_hits == 0)
+            wprint(L"[!] hook ไม่แตกเลยสักครั้ง (hits=0) — จุด hook อาจผิดสำหรับ deef เวอร์ชันนี้\n");
+        else
+            wprint(L"[*] hook แตกทั้งหมด %llu ครั้ง\n", (unsigned long long)last_hits);
+        wprint(L"[*] deef ปิดแล้ว — ปิด loader ได้\n");
     }
     (void)wr;
     return 0;
@@ -603,6 +724,7 @@ int main(int argc, char **argv) {
     int retry, rc;
 
     g_out = GetStdHandle(STD_OUTPUT_HANDLE);
+    g_log = _wfopen(L"patcher_log.txt", L"w, ccs=UTF-8");
     SetConsoleOutputCP(65001);
     SetConsoleTitleA("Login Key Patcher - deef bypass (stealth)");
     /* force a TrueType font so Thai text renders (fixes ???? on raster fonts) */
@@ -616,7 +738,7 @@ int main(int argc, char **argv) {
     }
 
     wprint(L"=================================================\n");
-    wprint(L"     LOGIN KEY PATCHER v2  (STEALTH deef bypass)  \n");
+    wprint(L"     LOGIN KEY PATCHER v2.1 (STEALTH deef bypass) \n");
     wprint(L"=================================================\n");
 
     if (argi < argc && strcmp(argv[argi], "--direct") == 0) { direct = 1; argi++; }
@@ -656,6 +778,7 @@ int main(int argc, char **argv) {
     if (slash) *slash = 0;
     else strcpy(exe_dir, ".");
     _snprintf(target_exe, sizeof(target_exe), "%s\\deef.exe", exe_dir);
+    print_target_identity(target_exe);
 
     pid = find_pid("deef.exe");
     if (pid) {
@@ -724,6 +847,7 @@ int main(int argc, char **argv) {
 
     rc = do_stealth(h, pid, base, mode, key, username);
     CloseHandle(h);
+    if (g_log) fclose(g_log);
     if (rc != 0) {
         wprint(L"\nกด Enter เพื่อออก...");
         getchar();

@@ -2,6 +2,13 @@
 title Build LoginKeyPatcher
 cd /d "%~dp0"
 
+if exist "LoginKeyPatcher.exe" (
+    echo [i] LoginKeyPatcher.exe already exists - no need to build, just run it.
+    echo [i] Delete it first if you really want to rebuild from source.
+    pause
+    exit /b
+)
+
 echo [*] Building LoginKeyPatcher.exe (x64)...
 
 set CSC=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe
