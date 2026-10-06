@@ -1138,7 +1138,8 @@ static int tool_trace(HANDLE h, DWORD pid, uint64_t base, uint64_t *rvas, int n)
         return 1;
     }
     veh_addr = mem + L_VEH; done_addr = mem + L_DONE; stub_addr = mem + L_RTSTUB;
-    veh_len = sc_trace_veh(veh, datab);
+    veh_len = sc_trace_veh(veh, datab, datab + 0x40);
+    wpm(h, datab + 0x40, addrs, (SIZE_T)(n * 8)); /* slot->address verify table */
     {
         FARPROC addveh = GetProcAddress(GetModuleHandleA("kernel32.dll"), "AddVectoredExceptionHandler");
         stub_len = build_rtstub(stub, veh_addr, (uint64_t)(uintptr_t)addveh, datab + 0x80);
@@ -1232,7 +1233,7 @@ int main(int argc, char **argv) {
     }
 
     wprint(L"=================================================\n");
-    wprint(L"     LOGIN KEY PATCHER v2.4 (ENTRY-REDIRECT)      \n");
+    wprint(L"     LOGIN KEY PATCHER v2.5 (ENTRY-REDIRECT)      \n");
     wprint(L"=================================================\n");
 
     GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir));
