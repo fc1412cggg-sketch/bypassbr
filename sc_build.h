@@ -160,6 +160,32 @@ static int sc_build_custom(uint8_t *out, uint64_t login_screen, uint64_t main_sc
     return s->pos;
 }
 
+/* ENTRY-REDIRECT shellcode: runs INSTEAD of loginScreen (HWBP at its entry).
+ * rcx (login's arg1, AppContext) is forwarded untouched to mainScreen.
+ * Old login (validation, auth API, "Authentication failed." path) never executes.
+ * Ends with ret -> returns to loginScreen's caller with RAX=1 (success). */
+static int sc_build_entry(uint8_t *out, uint64_t main_screen, uint64_t fake_user, uint64_t fake_key) {
+    ScBuf b = { out, 0 }; ScBuf *s = &b;
+    static const uint8_t pro[] = {
+        0x53,                         /* push rbx */
+        0x56,                         /* push rsi */
+        0x57,                         /* push rdi */
+        0x41, 0x54,                   /* push r12 */
+        0x49, 0x89, 0xE4,             /* mov r12, rsp */
+        0x48, 0x83, 0xE4, 0xF0,       /* and rsp, -16 */
+        0x48, 0x83, 0xEC, 0x20        /* sub rsp, 0x20 */
+    };
+    SC_PUT(s, pro);
+    SC_PUT(s, B_MOV_RDX); sc_u64(s, fake_user);
+    SC_PUT(s, B_MOV_R8); sc_u64(s, fake_key);
+    SC_PUT(s, B_MOV_R9D1);
+    SC_PUT(s, B_MOV_RAX); sc_u64(s, main_screen);
+    SC_PUT(s, B_CALL_RAX);
+    { static const uint8_t m[] = { 0xB8, 0x01, 0x00, 0x00, 0x00 }; SC_PUT(s, m); } /* mov eax, 1 */
+    sc_epilogue(s, 0); /* restore regs + ret to login's caller */
+    return s->pos;
+}
+
 /* VEH handler stub: LONG Handler(EXCEPTION_POINTERS *p).
  * if (p->ExceptionRecord->ExceptionCode == SINGLE_STEP &&
  *     p->ExceptionRecord->ExceptionAddress == hook_addr) {

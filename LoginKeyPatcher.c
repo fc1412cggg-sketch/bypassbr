@@ -95,10 +95,12 @@ static void towide(const char *s, wchar_t *d, int n) {
 static void usage(void) {
     wprint(L"Usage:\n");
     wprint(L"  LoginKeyPatcher.exe [mode] [key] [username]   (stealth, default)\n\n");
+    wprint(L"  v2.4: ดักที่ตัว login เอง — จอ login + ตรวจ key + เรียก API เก่าไม่รันเลย\n");
+    wprint(L"        เข้าหน้าหลักตรง ไม่ต้องกรอกอะไร (key/username = ชื่อที่โชว์ในจอหลัก)\n\n");
     wprint(L"  mode:\n");
-    wprint(L"    any     = กรอก key อะไรก็ได้ (ยาว > 0) เข้าหน้าหลักทันที [default]\n");
-    wprint(L"    auto    = ข้ามหน้า login ไปหน้าหลักเลย ไม่ต้องกรอกอะไร\n");
-    wprint(L"    custom  = ใช้ได้เฉพาะ key ที่กำหนด (ไม่สนตัวพิมพ์เล็ก/ใหญ่)\n\n");
+    wprint(L"    any     = เข้าหน้าหลักตรง (ค่า default) [default]\n");
+    wprint(L"    auto    = เหมือน any\n");
+    wprint(L"    custom  = เหมือน any แต่กำหนด key/username ที่โชว์เอง\n\n");
     wprint(L"  Examples:\n");
     wprint(L"    LoginKeyPatcher.exe any\n");
     wprint(L"    LoginKeyPatcher.exe auto\n");
@@ -307,6 +309,47 @@ static int count_armed(DWORD pid, uint64_t addr) {
     return n;
 }
 
+/* remove our HWBP (slots whose address == hook) from all threads */
+static int disarm_all(DWORD pid, uint64_t addr) {
+    int n = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    THREADENTRY32 te;
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    te.dwSize = sizeof(te);
+    if (Thread32First(snap, &te)) {
+        do {
+            HANDLE ht;
+            CONTEXT ctx;
+            int s, touched = 0;
+            uint64_t *dr[4];
+            if (te.th32OwnerProcessID != pid) continue;
+            ht = open_thread_full(te.th32ThreadID);
+            if (!ht) continue;
+            if (SuspendThread(ht) == (DWORD)-1) { CloseHandle(ht); continue; }
+            memset(&ctx, 0, sizeof(ctx));
+            ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (GetThreadContext(ht, &ctx)) {
+                dr[0] = &ctx.Dr0; dr[1] = &ctx.Dr1; dr[2] = &ctx.Dr2; dr[3] = &ctx.Dr3;
+                for (s = 0; s < 4; s++) {
+                    if (*dr[s] == addr && ((ctx.Dr7 >> (2 * s)) & 3)) {
+                        ctx.Dr7 &= ~(1ULL << (2 * s));
+                        touched = 1;
+                    }
+                }
+                if (touched) {
+                    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                    SetThreadContext(ht, &ctx);
+                    n++;
+                }
+            }
+            ResumeThread(ht);
+            CloseHandle(ht);
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+    return n;
+}
+
 /* ---------------- VEH installation ----------------
  * System DLLs share one base address across all processes per boot, so the
  * local GetProcAddress result is valid inside the target too. */
@@ -454,9 +497,9 @@ static int do_restore(void) {
 /* ---------------- stealth install ---------------- */
 static int do_stealth(HANDLE h, DWORD pid, uint64_t base,
                       const char *mode, const char *key, const char *username) {
-    uint64_t hook = base + RVA_HOOK;
-    uint64_t cont = hook + HOOK_LEN;
-    uint64_t login_screen = base + RVA_LOGIN_SCREEN;
+    /* v2.4: hook the login function ENTRY itself (the old wrapper point is dead:
+     * it never executes). Login validation + auth API never run at all. */
+    uint64_t hook = base + RVA_LOGIN_SCREEN;
     uint64_t main_screen = base + RVA_MAIN_SCREEN;
     uint8_t orig[HOOK_LEN];
     int i;
@@ -503,17 +546,11 @@ static int do_stealth(HANDLE h, DWORD pid, uint64_t base,
         FARPROC addveh = GetProcAddress(GetModuleHandleA("kernel32.dll"), "AddVectoredExceptionHandler");
         stub_len = build_rtstub(stub, veh_addr, (uint64_t)(uintptr_t)addveh, datab);
     }
-    if (strcmp(mode, "auto") == 0) {
-        code_len = sc_build_auto(code, main_screen, user_str, key_str, cont);
-    } else if (strcmp(mode, "custom") == 0) {
-        char klower[129];
-        strtolower_ascii(klower, key, sizeof(klower));
-        wpm(h, expect, klower, strlen(klower));
-        code_len = sc_build_custom(code, login_screen, main_screen, user_str, expect,
-                                   (uint32_t)strlen(klower), cont);
-    } else {
-        code_len = sc_build_any(code, login_screen, main_screen, user_str, cont);
-    }
+    /* entry-redirect: show main UI instead of login, return success to caller.
+     * key/username only set the displayed identity (login UI never appears). */
+    (void)expect;
+    (void)mode;
+    code_len = sc_build_entry(code, main_screen, user_str, key_str);
 
     sc_std_string(st, username, user_lng, longbuf);
     if (strlen(username) > 15) wpm(h, user_lng, longbuf, strlen(username) + 1);
@@ -558,7 +595,8 @@ static int do_stealth(HANDLE h, DWORD pid, uint64_t base,
         return 1;
     }
     wprint(L"[+] ใส่ hardware breakpoint แล้ว %d threads (slot ว่าง, ไม่ทับของเดิม)\n", armed);
-    wprint(L"[*] hook=0x%llX cont=0x%llX\n", (unsigned long long)hook, (unsigned long long)cont);
+    wprint(L"[*] hook=login entry 0x%llX (จอ login จะไม่โผล่เลย — ข้ามเข้าหน้าหลักตรง)\n",
+           (unsigned long long)hook);
     /* verify: read back debug regs from one thread + dump memory context */
     {
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
@@ -590,29 +628,37 @@ static int do_stealth(HANDLE h, DWORD pid, uint64_t base,
     }
     {
         uint8_t dump[32];
-        if (rpm(h, base + RVA_WRAPPER, dump, 32)) print_hex(L"[*] wrapper @0x21A0B0: ", dump, 32);
-        if (rpm(h, hook, dump, 32)) print_hex(L"[*] hook @0x21A0B9 (+32): ", dump, 32);
+        if (rpm(h, hook, dump, 32)) print_hex(L"[*] login entry @0x214370 (+32): ", dump, 32);
     }
 
-    wprint(L"\n[OK] STEALTH PATCH สำเร็จ! (ไม่ได้แก้โค้ด deef.exe เลย)\n");
-    if (strcmp(mode, "any") == 0) wprint(L"[OK] กรอก key อะไรก็ได้ (ห้ามว่าง) -> เข้าหน้าหลักทันที\n");
-    else if (strcmp(mode, "auto") == 0) wprint(L"[OK] ข้ามหน้า login เข้าหน้าหลักอัตโนมัติ\n");
-    else {
-        wchar_t wk[160];
+    {
+        wchar_t wk[160], wu[80];
         towide(key, wk, 160);
-        wprint(L"[OK] ใช้ key \"%s\" (ไม่สนพิมพ์เล็ก/ใหญ่) เพื่อเข้าใช้งาน\n", wk);
+        towide(username, wu, 80);
+        wprint(L"\n[OK] STEALTH PATCH สำเร็จ! (ไม่ได้แก้โค้ด deef.exe เลย)\n");
+        wprint(L"[OK] จอ login เก่า + ระบบตรวจ key + เรียก API จะไม่รันเลย — เข้าหน้าหลักตรง\n");
+        wprint(L"[OK] identity ที่โชว์: user=\"%s\" key=\"%s\"\n", wu, wk);
     }
     wprint(L"[*] ห้ามปิดหน้าต่างนี้ — loader ต้องค้างไว้เลี้ยง breakpoint (กด Ctrl+C เพื่อปิด)\n");
 
     /* watchdog (500ms): poll hit counter, arm new threads, re-arm + wipe check */
     {
-        int tick = 0, last_armed = armed;
-        uint64_t last_hits = 0, shown_hits = 0;
+        int tick = 0, last_armed = armed, tripped = 0;
+        uint64_t last_hits = 0, shown_hits = 0, prev = 0;
         for (;;) {
             uint64_t hits = 0;
             Sleep(500);
             if (!target_alive(h)) break;
             rpm(h, counter, &hits, 8);
+            /* rate guard: login entry should fire ~once; a flood means wrong spot */
+            if (tick <= 10 && !tripped && hits - prev > 40) {
+                int d = disarm_all(pid, hook);
+                wprint(L"[!] จุด hook ถูกเรียกถี่ผิดปกติ (%llu ครั้ง/0.5วิ) — ไม่ใช่ login! ปลด breakpoint แล้ว %d threads\n",
+                       (unsigned long long)(hits - prev), d);
+                wprint(L"[!] ปิด deef แล้วส่ง patcher_log.txt มา — จะหาจุดใหม่ให้\n");
+                tripped = 1;
+            }
+            prev = hits;
             if (hits != shown_hits && (hits <= 20 || tick % 4 == 0)) {
                 wprint(L"[HIT] hook แตกแล้ว! รวม %llu ครั้ง\n", (unsigned long long)hits);
                 shown_hits = hits;
@@ -628,7 +674,7 @@ static int do_stealth(HANDLE h, DWORD pid, uint64_t base,
             }
         }
         if (last_hits == 0)
-            wprint(L"[!] hook ไม่แตกเลยสักครั้ง (hits=0) — จุด hook อาจผิดสำหรับ deef เวอร์ชันนี้\n");
+            wprint(L"[!] hook ไม่แตกเลยสักครั้ง (hits=0) — ส่ง log นี้มา จะหาจุดใหม่ให้\n");
         else
             wprint(L"[*] hook แตกทั้งหมด %llu ครั้ง\n", (unsigned long long)last_hits);
         wprint(L"[*] deef ปิดแล้ว — ปิด loader ได้\n");
@@ -1186,7 +1232,7 @@ int main(int argc, char **argv) {
     }
 
     wprint(L"=================================================\n");
-    wprint(L"     LOGIN KEY PATCHER v2.3 (STEALTH + TRACER)    \n");
+    wprint(L"     LOGIN KEY PATCHER v2.4 (ENTRY-REDIRECT)      \n");
     wprint(L"=================================================\n");
 
     GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir));
@@ -1257,7 +1303,7 @@ int main(int argc, char **argv) {
     if (strcmp(mode, "custom") == 0 && key[0] == 0) {
         wprint(L"[!] custom mode ต้องระบุ key ด้วย\n"); usage(); return 1;
     }
-    if (strcmp(mode, "auto") == 0 && key[0] == 0) strcpy(key, "VIP-PREMIUM");
+    if (key[0] == 0) strcpy(key, "VIP-PREMIUM");
 
     towide(mode, wmode, 16);
     towide(username, wuser, 80);
