@@ -2,25 +2,15 @@
 
 Login-key bypass / patcher for `deef.exe` (x64).
 
-## Files หลัก
-
-| ไฟล์ | คืออะไร |
-|---|---|
-| `LoginKeyPatcher.cs` | ตัว patch หลัก (C#, แนะนำ) — 3 โหมดในไฟล์เดียว |
-| `login_key_patch.py` | ตัว patch ภาษา Python (logic เดียวกัน, ไม่ต้องลง lib เพิ่ม) |
-| `Build_LoginKeyPatcher.bat` | คอมไพล์ `.cs` → `.exe` (x64) |
-| `Run_LoginKeyPatcher.bat` | เมนูเลือกโหมดแล้วรัน |
-| `FdrrAutoPatcher.cs` / `MadiumLoader.cs` | ตัวเก่า (เก็บไว้) |
-
-## วิธีใช้ (บน Windows 64-bit)
+## พร้อมใช้ทันที (ไม่ต้อง build)
 
 ```
-1. วางไฟล์ทั้งหมดไว้โฟลเดอร์เดียวกับ deef.exe
-2. รัน Build_LoginKeyPatcher.bat (ครั้งเดียว) → ได้ LoginKeyPatcher.exe
-3. รัน Run_LoginKeyPatcher.bat แล้วเลือกโหมด (หรือดูคำสั่งด้านล่าง)
+1. copy LoginKeyPatcher.exe ไปไว้โฟลเดอร์เดียวกับ deef.exe
+2. ดับเบิลคลิก LoginKeyPatcher.exe (หรือรันผ่าน Run_LoginKeyPatcher.bat)
 ```
 
-> รันแบบ **Run as Administrator** ถ้า patch ไม่ติด
+> `.exe` เป็น native x64 ไฟล์เดียว (193 KB) ไม่ต้องลง .NET / Python / อะไรเพิ่ม —
+> รันบน Windows 10/11 ได้เลย ถ้า patch ไม่ติดให้รันแบบ **Run as Administrator**
 
 ## โหมด
 
@@ -31,13 +21,23 @@ LoginKeyPatcher.exe custom MyKey123 "VIP User" → ใช้ได้เฉพ�
 LoginKeyPatcher.exe --restore                  → คืนค่า hook เดิม (ต้องมี hook_backup.bin)
 ```
 
-เวอร์ชัน Python ใช้คำสั่งเหมือนกัน:
+## Source
+
+| ไฟล์ | คืออะไร |
+|---|---|
+| `LoginKeyPatcher.exe` | **ตัวพร้อมใช้** (native x64, build จาก `.c`) |
+| `LoginKeyPatcher.c` + `sc_build.h` | source ตัวหลัก (C, cross-compile ด้วย zig) |
+| `LoginKeyPatcher.cs` | source เวอร์ชัน C# (logic เดียวกัน) |
+| `login_key_patch.py` | เวอร์ชัน Python (ไม่ต้องลง lib เพิ่ม) |
+| `Build_LoginKeyPatcher.bat` | คอมไพล์ `.cs` → `.exe` บน Windows (ถ้าจะ build เอง) |
+| `Run_LoginKeyPatcher.bat` | เมนูเลือกโหมดแล้วรัน |
+| `FdrrAutoPatcher.cs` / `MadiumLoader.cs` | ตัวเก่า (เก็บไว้) |
+
+Rebuild ตัว native เองบน Linux:
 
 ```
-python login_key_patch.py any
-python login_key_patch.py auto
-python login_key_patch.py custom MyKey123 "VIP User"
-python login_key_patch.py --restore
+pip install ziglang
+python -m ziglang cc -target x86_64-windows-gnu -O2 -o LoginKeyPatcher.exe LoginKeyPatcher.c -lpsapi
 ```
 
 ## หลักการ (สั้นๆ)
