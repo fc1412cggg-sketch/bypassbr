@@ -363,6 +363,9 @@ namespace LoginKeyPatcher
             bw.Write((byte)0x53); // push rbx
             bw.Write((byte)0x56); // push rsi
             bw.Write((byte)0x57); // push rdi
+            bw.Write(new byte[] { 0x41, 0x54 }); // push r12
+            bw.Write(new byte[] { 0x49, 0x89, 0xE4 }); // mov r12, rsp
+            bw.Write(new byte[] { 0x48, 0x83, 0xE4, 0xF0 }); // and rsp, -16 (ABI-safe inner calls)
             bw.Write(new byte[] { 0x48, 0x83, 0xEC, 0x20 }); // sub rsp, 0x20
             bw.Write(new byte[] { 0x48, 0x89, 0xCB });       // mov rbx, rcx
             bw.Write(new byte[] { 0x48, 0x8D, 0xB3, 0xB8, 0x01, 0x00, 0x00 }); // lea rsi, [rbx+0x1B8]
@@ -373,7 +376,8 @@ namespace LoginKeyPatcher
 
         static void WriteEpilogue(BinaryWriter bw)
         {
-            bw.Write(new byte[] { 0x48, 0x83, 0xC4, 0x20 }); // add rsp, 0x20
+            bw.Write(new byte[] { 0x4C, 0x89, 0xE4 }); // mov rsp, r12 (restore exact entry Rsp)
+            bw.Write(new byte[] { 0x41, 0x5C }); // pop r12
             bw.Write((byte)0x5F); // pop rdi
             bw.Write((byte)0x5E); // pop rsi
             bw.Write((byte)0x5B); // pop rbx

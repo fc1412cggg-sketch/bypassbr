@@ -131,6 +131,9 @@ def prologue():
     c += b"\x53"                                     # push rbx
     c += b"\x56"                                     # push rsi
     c += b"\x57"                                     # push rdi
+    c += b"\x41\x54"                                 # push r12
+    c += b"\x49\x89\xe4"                             # mov r12, rsp
+    c += b"\x48\x83\xe4\xf0"                         # and rsp, -16 (ABI-safe inner calls)
     c += b"\x48\x83\xec\x20"                         # sub rsp, 0x20
     c += b"\x48\x89\xcb"                             # mov rbx, rcx
     c += b"\x48\x8d\xb3\xb8\x01\x00\x00"             # lea rsi, [rbx+0x1B8]
@@ -141,7 +144,8 @@ def prologue():
 
 
 def epilogue(c):
-    c += b"\x48\x83\xc4\x20"                         # add rsp, 0x20
+    c += b"\x4c\x89\xe4"                             # mov rsp, r12 (restore exact entry Rsp)
+    c += b"\x41\x5c"                                 # pop r12
     c += b"\x5f\x5e\x5b\xc3"                         # pop rdi/rsi/rbx; ret
 
 

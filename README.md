@@ -1,16 +1,21 @@
 # bypassbr
 
-Login-key bypass / patcher for `deef.exe` (x64).
+Login-key bypass / patcher for `deef.exe` (x64, Enigma-protected).
 
 ## พร้อมใช้ทันที (ไม่ต้อง build)
 
 ```
 1. copy LoginKeyPatcher.exe ไปไว้โฟลเดอร์เดียวกับ deef.exe
 2. ดับเบิลคลิก LoginKeyPatcher.exe (หรือรันผ่าน Run_LoginKeyPatcher.bat)
+3. ห้ามปิดหน้าต่าง loader ขณะใช้ deef (ต้องค้างไว้เลี้ยง breakpoint)
 ```
 
-> `.exe` เป็น native x64 ไฟล์เดียว (193 KB) ไม่ต้องลง .NET / Python / อะไรเพิ่ม —
-> รันบน Windows 10/11 ได้เลย ถ้า patch ไม่ติดให้รันแบบ **Run as Administrator**
+> `.exe` เป็น native x64 ไฟล์เดียว ไม่ต้องลง .NET / Python / อะไรเพิ่ม —
+> รันบน Windows 10/11 ได้เลย ถ้าติดตั้ง VEH ไม่ได้ให้รันแบบ **Run as Administrator**
+>
+> v2 ใช้วิธี **STEALTH: ไม่แก้โค้ด deef.exe ใน memory เลยสัก byte**
+> (เลี่ยง Enigma "File corrupted!" check) ด้วย hardware breakpoint + VEH —
+> ถ้าเจอป๊อป "debugger detected" แทน ให้แจ้งมา (ต้องเปลี่ยนแผนเป็นขั้นต่อไป)
 
 ## โหมด
 
@@ -18,7 +23,8 @@ Login-key bypass / patcher for `deef.exe` (x64).
 LoginKeyPatcher.exe any                        → กรอก key อะไรก็ได้ (ห้ามว่าง) เข้าหน้าหลักทันที
 LoginKeyPatcher.exe auto                       → ข้ามหน้า login เข้าหลักเลย ไม่ต้องกรอก
 LoginKeyPatcher.exe custom MyKey123 "VIP User" → ใช้ได้เฉพาะ key ที่กำหนด (ไม่สนพิมพ์เล็ก/ใหญ่)
-LoginKeyPatcher.exe --restore                  → คืนค่า hook เดิม (ต้องมี hook_backup.bin)
+LoginKeyPatcher.exe --direct any               → วิธีเก่า (แก้โค้ดตรงๆ — Enigma จับได้)
+LoginKeyPatcher.exe --restore                  → คืนค่า hook เดิม (สำหรับโหมด direct)
 ```
 
 ## Source
@@ -27,8 +33,7 @@ LoginKeyPatcher.exe --restore                  → คืนค่า hook เ�
 |---|---|
 | `LoginKeyPatcher.exe` | **ตัวพร้อมใช้** (native x64, build จาก `.c`) |
 | `LoginKeyPatcher.c` + `sc_build.h` | source ตัวหลัก (C, cross-compile ด้วย zig) |
-| `LoginKeyPatcher.cs` | source เวอร์ชัน C# (logic เดียวกัน) |
-| `login_key_patch.py` | เวอร์ชัน Python (ไม่ต้องลง lib เพิ่ม) |
+| `LoginKeyPatcher.cs` / `login_key_patch.py` | เวอร์ชัน C#/Python (direct-patch อย่างเดียว — Enigma จับได้, เก็บไว้เทียบ logic) |
 | `Build_LoginKeyPatcher.bat` | คอมไพล์ `.cs` → `.exe` บน Windows (ถ้าจะ build เอง) |
 | `Run_LoginKeyPatcher.bat` | เมนูเลือกโหมดแล้วรัน |
 | `FdrrAutoPatcher.cs` / `MadiumLoader.cs` | ตัวเก่า (เก็บไว้) |
@@ -40,13 +45,14 @@ pip install ziglang
 python -m ziglang cc -target x86_64-windows-gnu -O2 -o LoginKeyPatcher.exe LoginKeyPatcher.c -lpsapi
 ```
 
-## หลักการ (สั้นๆ)
+## หลักการ v2 (STEALTH)
 
-- รอ `deef.exe` unpack ใน memory (เช็ค prologue ที่ RVA `0x21A0B0`)
-- วาง shellcode ใน RWX block + hook จุด screen-router ที่ RVA `0x21A0B9`
-  (`mov rax, shellcode; call rax; nop; nop` = 14 bytes)
-- shellcode อ่าน key ที่ user พิมพ์จาก `AppContext+0x1B8` (MSVC `std::string`,
-  รองรับ SSO/heap) แล้ว route ไป `mainScreen` (`0x2194B0`) หรือ
-  `loginScreen` (`0x214370`) ตามโหมด — ส่ง key ที่พิมพ์จริง pass-through
-  กลับไปให้ UI โชว์
-- backup 14 bytes เดิมไว้ที่ `hook_backup.bin` อัตโนมัติ
+- รอ `deef.exe` unpack ใน memory (เช็ค prologue ที่ RVA `0x21A0B0` — อ่านอย่างเดียว)
+- shellcode + VEH handler อยู่ใน memory block ของเราเอง (RX, นอก image — Enigma ไม่เช็ค)
+- ฝัง hardware execution breakpoint (Dr0–Dr3, เลือก slot ว่าง) ที่ RVA `0x21A0B9`
+  ทุก thread + watchdog คอย arm thread ใหม่ทุก 1 วินาที
+- ติดตั้ง VEH ด้วย thread hijack (ไม่สร้าง thread ใหม่, ไม่ attach debugger,
+  ไม่แตะ PEB) — มี CreateRemoteThread เป็น fallback
+- เมื่อ breakpoint แตก: VEH ส่ง execution มาที่ shellcode → route ไป
+  `mainScreen` (`0x2194B0`) หรือ `loginScreen` (`0x214370`) ตามโหมด →
+  กระโดดกลับ `hook+14` — stack/register เหมือนเดิมทุกประการ
