@@ -364,6 +364,57 @@ static int sc_test_veh2(uint8_t *out, uint64_t datab, uint64_t fault_addr) {
     return (int)(p - out);
 }
 
+/* TRIGGER-AGNOSTIC redirect handler: รับเหตุการณ์ได้ 3 แบบ
+ *   EXCEPTION_SINGLE_STEP (0x80000004) = hardware breakpoint
+ *   EXCEPTION_BREAKPOINT  (0x80000003) = int3 (0xCC) ที่เราเขียน
+ *   EXCEPTION_GUARD_PAGE  (0x80000001) = หน้าเพจที่ตั้ง PAGE_GUARD
+ * ถ้า ExceptionAddress == trigger_addr -> ข้ามไปทำ shellcode แทน (login เก่าไม่รัน)
+ * นอกนั้นคืน CONTINUE_SEARCH (ไม่ยุ่งกับของ Enigma เลย) */
+static int sc_any_veh(uint8_t *out, uint64_t trigger_addr, uint64_t shell_addr,
+                      uint64_t counter_addr) {
+    ScBuf b = { out, 0 }; ScBuf *s = &b;
+    static const uint8_t m1[] = { 0x48, 0x8B, 0x01 };                 /* mov rax,[rcx] (ExcRecord) */
+    static const uint8_t m2[] = { 0x48, 0x8B, 0x51, 0x08 };           /* mov rdx,[rcx+8] (Context) */
+    static const uint8_t m3[] = { 0x44, 0x8B, 0x00 };                 /* mov r8d,[rax] (code) */
+    static const uint8_t m4[] = { 0x4C, 0x8B, 0x48, 0x10 };           /* mov r9,[rax+0x10] (addr) */
+    static const uint8_t cm[] = { 0x41, 0x81, 0xF8 };                 /* cmp r8d, imm32 */
+    static const uint8_t c1[] = { 0x04, 0x00, 0x00, 0x80 };           /* SINGLE_STEP */
+    static const uint8_t c2[] = { 0x03, 0x00, 0x00, 0x80 };           /* BREAKPOINT */
+    static const uint8_t c3[] = { 0x01, 0x00, 0x00, 0x80 };           /* GUARD_PAGE */
+    static const uint8_t m5[] = { 0x49, 0x39, 0xC1 };                 /* cmp r9, rax */
+    static const uint8_t m6[] = { 0x48, 0x89, 0x82,
+                                  0xF8, 0x00, 0x00, 0x00 };           /* mov [rdx+0xF8], rax */
+    static const uint8_t m7[] = { 0x48, 0xFF, 0x00 };                 /* inc qword [rax] */
+    SC_PUT(s, m1);
+    SC_PUT(s, m2);
+    SC_PUT(s, m3);
+    SC_PUT(s, m4);
+    SC_PUT(s, cm); SC_PUT(s, c1);
+    int je1 = s->pos; sc_u8(s, 0x74); sc_u8(s, 0x00);
+    SC_PUT(s, cm); SC_PUT(s, c2);
+    int je2 = s->pos; sc_u8(s, 0x74); sc_u8(s, 0x00);
+    SC_PUT(s, cm); SC_PUT(s, c3);
+    int jne3 = s->pos; sc_u8(s, 0x75); sc_u8(s, 0x00);
+    int ok = s->pos;
+    SC_PUT(s, B_MOV_RAX); sc_u64(s, trigger_addr);
+    SC_PUT(s, m5);
+    int jne4 = s->pos; sc_u8(s, 0x75); sc_u8(s, 0x00);
+    SC_PUT(s, B_MOV_RAX); sc_u64(s, shell_addr);
+    SC_PUT(s, m6);
+    SC_PUT(s, B_MOV_RAX); sc_u64(s, counter_addr);
+    SC_PUT(s, m7);
+    sc_u8(s, 0x31); sc_u8(s, 0xC0);
+    sc_u8(s, 0xC3);
+    int search = s->pos;
+    { static const uint8_t z[] = { 0xB8, 0x01, 0x00, 0x00, 0x00 }; SC_PUT(s, z); }
+    sc_u8(s, 0xC3);
+    out[je1 + 1]  = (uint8_t)(ok - (je1 + 2));
+    out[je2 + 1]  = (uint8_t)(ok - (je2 + 2));
+    out[jne3 + 1] = (uint8_t)(search - (jne3 + 2));
+    out[jne4 + 1] = (uint8_t)(search - (jne4 + 2));
+    return s->pos;
+}
+
 /* MSVC std::string (32 bytes). If text > 15 chars, chars (+NUL) go to longbuf
  * and the struct points at longaddr. longbuf must fit strlen(text)+1. */
 static void sc_std_string(uint8_t st[32], const char *text, uint64_t longaddr, uint8_t *longbuf) {
