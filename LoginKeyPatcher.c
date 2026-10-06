@@ -29,6 +29,7 @@
 #include <stddef.h>
 #include <wchar.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include "sc_build.h"
 
 /* ---- ABI offsets used by the VEH stub (verified at compile time) ---- */
@@ -104,6 +105,12 @@ static void usage(void) {
     wprint(L"    LoginKeyPatcher.exe custom MySecret123 \"VIP User\"\n");
     wprint(L"    LoginKeyPatcher.exe --direct any   (วิธีเก่า: แก้โค้ดตรงๆ — Enigma จับได้)\n");
     wprint(L"    LoginKeyPatcher.exe --restore      (คืนค่า hook เดิม)\n\n");
+    wprint(L"  RE tools (หาจุด hook จริง — ไม่อ่านอย่างเดียว, ไม่แก้โค้ด):\n");
+    wprint(L"    --diag                  ชุดสำรวจครบ (scan calls + หาข้อความ) รันครั้งเดียว\n");
+    wprint(L"    --scan-calls <RVA>      หา CALL/JMP ที่เรียก address นั้น (hex)\n");
+    wprint(L"    --findstr <text>        หาข้อความใน memory (ASCII + UTF-16)\n");
+    wprint(L"    --scan-ref <addr>       หาโค้ดที่อ้างถึง address นั้น (hex, runtime addr)\n");
+    wprint(L"    --trace <RVA..>         นับว่าโค้ดวิ่งผ่านจุดนั้นกี่ครั้ง (1-4 จุด)\n\n");
 }
 
 static DWORD find_pid(const char *name) {
@@ -706,6 +713,382 @@ static int do_direct(HANDLE h, uint64_t base,
     return 0;
 }
 
+/* ================= RE toolkit (scan + trace, zero image writes) ================= */
+
+static uint64_t get_module_size(HANDLE h, uint64_t base) {
+    MODULEINFO mi;
+    memset(&mi, 0, sizeof(mi));
+    if (GetModuleInformation(h, (HMODULE)(uintptr_t)base, &mi, sizeof(mi)))
+        return mi.SizeOfImage;
+    return 0;
+}
+
+typedef void (*chunk_cb)(uint64_t chunk_rva, uint8_t *buf, SIZE_T len, void *ctx);
+
+/* walk committed regions of the module, read in <=1MB chunks */
+static void walk_image(HANDLE h, uint64_t base, uint64_t size, int exec_only, chunk_cb cb, void *ctx) {
+    uint64_t addr = base, end = base + size;
+    uint8_t *buf = (uint8_t *)malloc(1024 * 1024);
+    if (!buf) return;
+    while (addr < end) {
+        MEMORY_BASIC_INFORMATION mbi;
+        uint64_t rbase, rend, p;
+        if (VirtualQueryEx(h, (LPCVOID)(uintptr_t)addr, &mbi, sizeof(mbi)) == 0) break;
+        if (mbi.RegionSize == 0) break;
+        rbase = (uint64_t)(uintptr_t)mbi.BaseAddress;
+        rend = rbase + mbi.RegionSize;
+        if (rbase < base) rbase = base;
+        if (rend > end) rend = end;
+        if (mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+            int is_exec = (mbi.Protect & 0xF0) != 0;
+            if (!exec_only || is_exec) {
+                for (p = rbase; p < rend; p += 1024 * 1024) {
+                    SIZE_T n = rend - p, done = 0;
+                    if (n > 1024 * 1024) n = 1024 * 1024;
+                    if (ReadProcessMemory(h, (LPCVOID)(uintptr_t)p, buf, n, &done) && done > 0)
+                        cb(p - base, buf, done, ctx);
+                }
+            }
+        }
+        addr = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+    }
+    free(buf);
+}
+
+/* ---- shared target open: find/launch + wait unpack ---- */
+static int open_target(const char *target_exe, const char *exe_dir,
+                       DWORD *out_pid, HANDLE *out_h, uint64_t *out_base) {
+    DWORD pid = find_pid("deef.exe");
+    HANDLE h = NULL;
+    uint64_t base = 0;
+    int retry;
+    if (pid) {
+        wprint(L"[+] พบ deef.exe ที่รันอยู่ (PID: %lu)\n", (unsigned long)pid);
+    } else {
+        DWORD attr = GetFileAttributesA(target_exe);
+        if (attr == INVALID_FILE_ATTRIBUTES) {
+            wchar_t wdir[512];
+            towide(exe_dir, wdir, 512);
+            wprint(L"[!] ไม่พบไฟล์ deef.exe ใน %s\n", wdir);
+            return 0;
+        }
+        wprint(L"[*] กำลังเปิด deef.exe...\n");
+        {
+            STARTUPINFOA si;
+            PROCESS_INFORMATION pi;
+            char cmd[620];
+            memset(&si, 0, sizeof(si));
+            si.cb = sizeof(si);
+            memset(&pi, 0, sizeof(pi));
+            _snprintf(cmd, sizeof(cmd), "\"%s\"", target_exe);
+            if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, 0, NULL, exe_dir, &si, &pi)) {
+                wprint(L"[!] เปิด deef.exe ไม่ได้ err=%lu\n", GetLastError());
+                return 0;
+            }
+            pid = pi.dwProcessId;
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            wprint(L"[+] เปิด deef.exe สำเร็จ (PID: %lu)\n", (unsigned long)pid);
+        }
+    }
+    wprint(L"[*] รอโปรแกรมโหลด/Unpack ใน memory...\n");
+    for (retry = 0; retry < 60; retry++) {
+        uint8_t t[8];
+        Sleep(500);
+        if (!find_pid("deef.exe")) { wprint(L"[!] โปรแกรมเป้าหมายถูกปิด\n"); return 0; }
+        h = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+        if (!h) continue;
+        base = get_module_base(h, "deef.exe");
+        if (base && rpm(h, base + RVA_WRAPPER, t, 8) && t[0] == 0x40 && t[1] == 0x53) {
+            wprint(L"[+] Unpack เสร็จ! Base: 0x%llX\n", (unsigned long long)base);
+            break;
+        }
+        CloseHandle(h);
+        h = NULL;
+    }
+    if (!h || !base) {
+        wprint(L"[!] หา Base Address ไม่เจอ (รันแบบ Admin แล้วหรือยัง?)\n");
+        return 0;
+    }
+    *out_pid = pid;
+    *out_h = h;
+    *out_base = base;
+    return 1;
+}
+
+/* ---- --scan-calls <rva>: find CALL/JMP rel32 targeting base+rva ---- */
+typedef struct { HANDLE h; uint64_t base; uint64_t want; int found; int cap; } ScanCallsCtx;
+
+static void scan_calls_cb(uint64_t chunk_rva, uint8_t *buf, SIZE_T len, void *vctx) {
+    ScanCallsCtx *c = (ScanCallsCtx *)vctx;
+    SIZE_T i;
+    for (i = 0; i + 5 <= len && c->found < c->cap; i++) {
+        if (buf[i] != 0xE8 && buf[i] != 0xE9) continue;
+        {
+            int32_t rel;
+            uint64_t tgt;
+            memcpy(&rel, buf + i + 1, 4);
+            tgt = c->base + chunk_rva + i + 5 + (int64_t)rel;
+            if (tgt == c->want) {
+                int s = (i >= 8) ? (int)i - 8 : 0;
+                int e = (int)i + 16;
+                if (e > (int)len) e = (int)len;
+                wprint(L"  %s @RVA 0x%llX\n", buf[i] == 0xE8 ? L"CALL" : L"JMP ",
+                       (unsigned long long)(chunk_rva + i));
+                print_hex(L"    bytes: ", buf + s, e - s);
+                c->found++;
+            }
+        }
+    }
+}
+
+static void tool_scan_calls(HANDLE h, uint64_t base, uint64_t size, uint64_t want_rva) {
+    ScanCallsCtx ctx;
+    ctx.h = h; ctx.base = base; ctx.want = base + want_rva; ctx.found = 0; ctx.cap = 300;
+    wprint(L"[*] scan CALL/JMP -> RVA 0x%llX (abs 0x%llX)...\n",
+           (unsigned long long)want_rva, (unsigned long long)ctx.want);
+    walk_image(h, base, size, 1, scan_calls_cb, &ctx);
+    wprint(L"[*] พบ %d จุด\n", ctx.found);
+}
+
+/* ---- --findstr <text>: find ASCII + UTF-16LE strings in module memory ---- */
+typedef struct {
+    uint8_t pa[256]; int la;
+    uint8_t pw[512]; int lw;
+    uint64_t base; int found; int cap;
+} FindStrCtx;
+
+static SIZE_T find_bytes(uint8_t *buf, SIZE_T len, uint8_t *pat, int plen, SIZE_T start) {
+    SIZE_T i;
+    if (plen <= 0 || (SIZE_T)plen > len) return (SIZE_T)-1;
+    for (i = start; i + (SIZE_T)plen <= len; i++)
+        if (memcmp(buf + i, pat, plen) == 0) return i;
+    return (SIZE_T)-1;
+}
+
+static void print_asc_ctx(uint8_t *buf, SIZE_T pos, SIZE_T len) {
+    SIZE_T s = (pos >= 16) ? pos - 16 : 0;
+    SIZE_T e = pos + 48;
+    SIZE_T i;
+    char tmp[80];
+    int o = 0;
+    if (e > len) e = len;
+    for (i = s; i < e && o < 70; i++) {
+        uint8_t c = buf[i];
+        tmp[o++] = (c >= 32 && c < 127) ? (char)c : '.';
+    }
+    tmp[o] = 0;
+    {
+        wchar_t w[80];
+        int k;
+        for (k = 0; k <= o; k++) w[k] = (wchar_t)(uint8_t)tmp[k];
+        wprint(L"    ...%s...\n", w);
+    }
+}
+
+static void findstr_cb(uint64_t chunk_rva, uint8_t *buf, SIZE_T len, void *vctx) {
+    FindStrCtx *c = (FindStrCtx *)vctx;
+    SIZE_T p = 0;
+    while (c->found < c->cap) {
+        p = find_bytes(buf, len, c->pa, c->la, p);
+        if (p == (SIZE_T)-1) break;
+        wprint(L"  [A] @ 0x%llX (RVA 0x%llX)\n",
+               (unsigned long long)(c->base + chunk_rva + p),
+               (unsigned long long)(chunk_rva + p));
+        print_asc_ctx(buf, p, len);
+        c->found++;
+        p++;
+    }
+    p = 0;
+    while (c->found < c->cap) {
+        p = find_bytes(buf, len, c->pw, c->lw, p);
+        if (p == (SIZE_T)-1) break;
+        wprint(L"  [W] @ 0x%llX (RVA 0x%llX)\n",
+               (unsigned long long)(c->base + chunk_rva + p),
+               (unsigned long long)(chunk_rva + p));
+        print_asc_ctx(buf, p, len);
+        c->found++;
+        p++;
+    }
+}
+
+static void tool_findstr(HANDLE h, uint64_t base, uint64_t size, const char *text) {
+    FindStrCtx ctx;
+    size_t n = strlen(text), i;
+    wchar_t w[300];
+    if (n == 0 || n > 120) { wprint(L"[!] ข้อความค้นหายาวเกินไป\n"); return; }
+    memset(&ctx, 0, sizeof(ctx));
+    memcpy(ctx.pa, text, n);
+    ctx.la = (int)n;
+    for (i = 0; i < n; i++) { ctx.pw[2 * i] = (uint8_t)text[i]; ctx.pw[2 * i + 1] = 0; }
+    ctx.lw = (int)(n * 2);
+    ctx.base = base; ctx.found = 0; ctx.cap = 50;
+    towide(text, w, 300);
+    wprint(L"[*] findstr \"%s\" (ASCII + UTF-16)...\n", w);
+    walk_image(h, base, size, 0, findstr_cb, &ctx);
+    wprint(L"[*] พบ %d จุด\n", ctx.found);
+}
+
+/* ---- --scan-ref <addr>: find LEA reg,[rip+rel] referencing runtime addr ---- */
+typedef struct { uint64_t base; uint64_t want; int found; int cap; } ScanRefCtx;
+
+static void scan_ref_cb(uint64_t chunk_rva, uint8_t *buf, SIZE_T len, void *vctx) {
+    ScanRefCtx *c = (ScanRefCtx *)vctx;
+    SIZE_T i;
+    for (i = 0; i + 8 <= len && c->found < c->cap; i++) {
+        SIZE_T j = i;
+        int32_t rel;
+        uint64_t tgt;
+        if (buf[j] >= 0x40 && buf[j] <= 0x4F) j++;
+        if (j + 6 > len) break;
+        if (buf[j] != 0x8D) continue;
+        if ((buf[j + 1] & 0xC7) != 0x05) continue; /* mod=00 rm=101 (rip-rel) */
+        memcpy(&rel, buf + j + 2, 4);
+        tgt = c->base + chunk_rva + j + 6 + (int64_t)rel;
+        if (tgt == c->want) {
+            int e = (int)i + 12;
+            if (e > (int)len) e = (int)len;
+            wprint(L"  LEA @RVA 0x%llX\n", (unsigned long long)(chunk_rva + i));
+            print_hex(L"    bytes: ", buf + i, e - (int)i);
+            c->found++;
+        }
+    }
+}
+
+static void tool_scan_ref(HANDLE h, uint64_t base, uint64_t size, uint64_t want) {
+    ScanRefCtx ctx;
+    ctx.base = base; ctx.want = want; ctx.found = 0; ctx.cap = 300;
+    wprint(L"[*] scan LEA-ref -> 0x%llX...\n", (unsigned long long)want);
+    walk_image(h, base, size, 1, scan_ref_cb, &ctx);
+    wprint(L"[*] พบ %d จุด\n", ctx.found);
+}
+
+/* ---- --trace rva...: HWBP hit counters (single-shot + periodic re-arm) ---- */
+static int force_arm_thread(HANDLE ht, uint64_t *addrs, int n) {
+    CONTEXT ctx;
+    uint64_t *dr[4];
+    int i;
+    if (SuspendThread(ht) == (DWORD)-1) return 0;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (!GetThreadContext(ht, &ctx)) { ResumeThread(ht); return 0; }
+    dr[0] = &ctx.Dr0; dr[1] = &ctx.Dr1; dr[2] = &ctx.Dr2; dr[3] = &ctx.Dr3;
+    for (i = 0; i < n; i++) {
+        int enabled = (int)((ctx.Dr7 >> (2 * i)) & 3);
+        if (enabled && *dr[i] != addrs[i]) { ResumeThread(ht); return 0; } /* foreign occupant */
+    }
+    for (i = 0; i < n; i++) {
+        *dr[i] = addrs[i];
+        ctx.Dr7 |= (1ULL << (2 * i));
+        ctx.Dr7 &= ~(0xFULL << (16 + 4 * i));
+        ctx.Dr6 &= ~(1ULL << i);
+    }
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    SetThreadContext(ht, &ctx);
+    ResumeThread(ht);
+    return 1;
+}
+
+static int force_arm_all(DWORD pid, uint64_t *addrs, int n) {
+    int ok = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    THREADENTRY32 te;
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    te.dwSize = sizeof(te);
+    if (Thread32First(snap, &te)) {
+        do {
+            HANDLE ht;
+            if (te.th32OwnerProcessID != pid) continue;
+            ht = open_thread_full(te.th32ThreadID);
+            if (!ht) continue;
+            if (force_arm_thread(ht, addrs, n)) ok++;
+            CloseHandle(ht);
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+    return ok;
+}
+
+static int tool_trace(HANDLE h, DWORD pid, uint64_t base, uint64_t *rvas, int n) {
+    uint64_t mem, datab;
+    uint64_t veh_addr, done_addr, stub_addr;
+    uint8_t veh[128], stub[64];
+    int veh_len, stub_len, i;
+    uint64_t addrs[4];
+    uint64_t veh_handle;
+    DWORD old = 0;
+    for (i = 0; i < n && i < 4; i++) addrs[i] = base + rvas[i];
+
+    mem = (uint64_t)(uintptr_t)VirtualAllocEx(h, NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    datab = (uint64_t)(uintptr_t)VirtualAllocEx(h, NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!mem || !datab) {
+        wprint(L"[!] VirtualAllocEx ล้มเหลว err=%lu\n", GetLastError());
+        return 1;
+    }
+    veh_addr = mem + L_VEH; done_addr = mem + L_DONE; stub_addr = mem + L_RTSTUB;
+    veh_len = sc_trace_veh(veh, datab);
+    {
+        FARPROC addveh = GetProcAddress(GetModuleHandleA("kernel32.dll"), "AddVectoredExceptionHandler");
+        stub_len = build_rtstub(stub, veh_addr, (uint64_t)(uintptr_t)addveh, datab + 0x80);
+    }
+    wpm(h, veh_addr, veh, veh_len);
+    {
+        uint8_t doneb[2] = { 0xEB, 0xFE };
+        wpm(h, done_addr, doneb, 2);
+    }
+    wpm(h, stub_addr, stub, stub_len);
+    VirtualProtectEx(h, (LPVOID)(uintptr_t)mem, 4096, PAGE_EXECUTE_READ, &old);
+
+    veh_handle = remote_add_veh_hijack(h, pid, veh_addr, done_addr);
+    if (!veh_handle) veh_handle = remote_add_veh_remote_thread(h, stub_addr, datab + 0x80);
+    if (!veh_handle) {
+        wprint(L"[!] ติดตั้ง VEH ไม่สำเร็จ\n");
+        return 1;
+    }
+    wprint(L"[+] VEH handle=0x%llX — tracing %d address(es):\n", (unsigned long long)veh_handle, n);
+    for (i = 0; i < n; i++)
+        wprint(L"    slot%d: RVA 0x%llX (0x%llX)\n", i,
+               (unsigned long long)rvas[i], (unsigned long long)addrs[i]);
+    force_arm_all(pid, addrs, n);
+    wprint(L"[*] ไปกดใช้งานใน deef ได้เลย — ตัวนับจะขึ้นเมื่อโค้ดวิ่งผ่านจุดนั้น (ปิด deef เพื่อจบ)\n");
+    {
+        uint64_t last[4] = { 0, 0, 0, 0 };
+        int tick = 0;
+        for (;;) {
+            uint64_t cur[4] = { 0, 0, 0, 0 };
+            int changed = 0;
+            Sleep(500);
+            if (!target_alive(h)) break;
+            for (i = 0; i < n; i++) {
+                rpm(h, datab + 8 * i, &cur[i], 8);
+                if (cur[i] != last[i]) changed = 1;
+                last[i] = cur[i];
+            }
+            if (changed) {
+                wprint(L"[TRACE]");
+                for (i = 0; i < n; i++)
+                    wprint(L"  0x%llX=%llu", (unsigned long long)rvas[i], (unsigned long long)cur[i]);
+                wprint(L"\n");
+            }
+            if (++tick % 4 == 0) force_arm_all(pid, addrs, n); /* re-arm single-shots */
+        }
+        wprint(L"[*] สรุป:");
+        for (i = 0; i < n; i++)
+            wprint(L"  0x%llX=%llu", (unsigned long long)rvas[i], (unsigned long long)last[i]);
+        wprint(L"\n[*] deef ปิดแล้ว — ปิด tracer ได้\n");
+    }
+    return 0;
+}
+
+/* ---- --diag: one-shot discovery batch ---- */
+static void tool_diag(HANDLE h, uint64_t base, uint64_t size) {
+    wprint(L"===== DIAG BATCH =====\n");
+    tool_scan_calls(h, base, size, RVA_LOGIN_SCREEN);
+    tool_scan_calls(h, base, size, RVA_MAIN_SCREEN);
+    tool_findstr(h, base, size, "Authentication failed.");
+    wprint(L"===== END DIAG =====\n");
+}
+
 /* ---------------- main ---------------- */
 int main(int argc, char **argv) {
     const char *mode = "any";
@@ -715,16 +1098,15 @@ int main(int argc, char **argv) {
     int argi = 1;
     wchar_t wmode[16], wuser[80];
     char exe_dir[512] = { 0 };
-    char target_exe[600], cmd[620];
+    char target_exe[600];
     char *slash;
-    DWORD attr;
     DWORD pid;
     HANDLE h = NULL;
     uint64_t base = 0;
-    int retry, rc;
+    int rc;
 
     g_out = GetStdHandle(STD_OUTPUT_HANDLE);
-    g_log = _wfopen(L"patcher_log.txt", L"w, ccs=UTF-8");
+    g_log = _wfopen(L"patcher_log.txt", L"a, ccs=UTF-8");
     SetConsoleOutputCP(65001);
     SetConsoleTitleA("Login Key Patcher - deef bypass (stealth)");
     /* force a TrueType font so Thai text renders (fixes ???? on raster fonts) */
@@ -738,8 +1120,58 @@ int main(int argc, char **argv) {
     }
 
     wprint(L"=================================================\n");
-    wprint(L"     LOGIN KEY PATCHER v2.1 (STEALTH deef bypass) \n");
+    wprint(L"     LOGIN KEY PATCHER v2.2 (STEALTH + TRACER)    \n");
     wprint(L"=================================================\n");
+
+    GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir));
+    slash = strrchr(exe_dir, '\\');
+    if (slash) *slash = 0;
+    else strcpy(exe_dir, ".");
+    _snprintf(target_exe, sizeof(target_exe), "%s\\deef.exe", exe_dir);
+
+    /* ---- RE tool modes ---- */
+    if (argi < argc && strncmp(argv[argi], "--", 2) == 0) {
+        if (strcmp(argv[argi], "--scan-calls") == 0 || strcmp(argv[argi], "--findstr") == 0 ||
+            strcmp(argv[argi], "--scan-ref") == 0 || strcmp(argv[argi], "--trace") == 0 ||
+            strcmp(argv[argi], "--diag") == 0) {
+            DWORD tpid;
+            HANDLE th = NULL;
+            uint64_t tbase = 0, tsize = 0;
+            int trc = 1;
+            print_target_identity(target_exe);
+            if (open_target(target_exe, exe_dir, &tpid, &th, &tbase)) {
+                tsize = get_module_size(th, tbase);
+                wprint(L"[*] module size=0x%llX\n", (unsigned long long)tsize);
+                if (tsize) {
+                    if (strcmp(argv[argi], "--scan-calls") == 0) {
+                        if (argi + 1 >= argc) { wprint(L"[!] ระบุ RVA เช่น --scan-calls 214370\n"); }
+                        else { tool_scan_calls(th, tbase, tsize, strtoull(argv[argi + 1], NULL, 16)); trc = 0; }
+                    } else if (strcmp(argv[argi], "--findstr") == 0) {
+                        if (argi + 1 >= argc) { wprint(L"[!] ระบุข้อความ เช่น --findstr \"Authentication failed.\"\n"); }
+                        else { tool_findstr(th, tbase, tsize, argv[argi + 1]); trc = 0; }
+                    } else if (strcmp(argv[argi], "--scan-ref") == 0) {
+                        if (argi + 1 >= argc) { wprint(L"[!] ระบุ address เช่น --scan-ref 7FF6A9ACA0B9\n"); }
+                        else { tool_scan_ref(th, tbase, tsize, strtoull(argv[argi + 1], NULL, 16)); trc = 0; }
+                    } else if (strcmp(argv[argi], "--trace") == 0) {
+                        uint64_t rvas[4];
+                        int n = 0;
+                        while (argi + 1 + n < argc && n < 4) {
+                            rvas[n] = strtoull(argv[argi + 1 + n], NULL, 16);
+                            n++;
+                        }
+                        if (n == 0) { wprint(L"[!] ระบุ RVA เช่น --trace 214370 2194B0\n"); }
+                        else { trc = tool_trace(th, tpid, tbase, rvas, n); }
+                    } else if (strcmp(argv[argi], "--diag") == 0) {
+                        tool_diag(th, tbase, tsize);
+                        trc = 0;
+                    }
+                }
+                CloseHandle(th);
+            }
+            if (g_log) fclose(g_log);
+            return trc;
+        }
+    }
 
     if (argi < argc && strcmp(argv[argi], "--direct") == 0) { direct = 1; argi++; }
     if (argi < argc) {
@@ -772,64 +1204,9 @@ int main(int argc, char **argv) {
         wprint(L"[*] Mode: %s%s  user=\"%s\"\n", direct ? L"DIRECT " : L"STEALTH ", wmode, wuser);
     }
 
-    /* ---- find or launch deef.exe ---- */
-    GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir));
-    slash = strrchr(exe_dir, '\\');
-    if (slash) *slash = 0;
-    else strcpy(exe_dir, ".");
-    _snprintf(target_exe, sizeof(target_exe), "%s\\deef.exe", exe_dir);
     print_target_identity(target_exe);
 
-    pid = find_pid("deef.exe");
-    if (pid) {
-        wprint(L"[+] พบ deef.exe ที่รันอยู่ (PID: %lu)\n", (unsigned long)pid);
-    } else {
-        attr = GetFileAttributesA(target_exe);
-        if (attr == INVALID_FILE_ATTRIBUTES) {
-            wchar_t wdir[512];
-            towide(exe_dir, wdir, 512);
-            wprint(L"[!] ไม่พบไฟล์ deef.exe ใน %s\n", wdir);
-            wprint(L"กด Enter เพื่อออก...");
-            getchar();
-            return 1;
-        }
-        wprint(L"[*] กำลังเปิด deef.exe...\n");
-        {
-            STARTUPINFOA si;
-            PROCESS_INFORMATION pi;
-            memset(&si, 0, sizeof(si));
-            si.cb = sizeof(si);
-            memset(&pi, 0, sizeof(pi));
-            _snprintf(cmd, sizeof(cmd), "\"%s\"", target_exe);
-            if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, 0, NULL, exe_dir, &si, &pi)) {
-                wprint(L"[!] เปิด deef.exe ไม่ได้ err=%lu\n", GetLastError());
-                return 1;
-            }
-            pid = pi.dwProcessId;
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
-            wprint(L"[+] เปิด deef.exe สำเร็จ (PID: %lu)\n", (unsigned long)pid);
-        }
-    }
-
-    /* ---- wait for unpack + get base (reading memory is safe) ---- */
-    wprint(L"[*] รอโปรแกรมโหลด/Unpack ใน memory...\n");
-    for (retry = 0; retry < 60; retry++) {
-        uint8_t t[8];
-        Sleep(500);
-        if (!find_pid("deef.exe")) { wprint(L"[!] โปรแกรมเป้าหมายถูกปิด\n"); return 1; }
-        h = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
-        if (!h) continue;
-        base = get_module_base(h, "deef.exe");
-        if (base && rpm(h, base + RVA_WRAPPER, t, 8) && t[0] == 0x40 && t[1] == 0x53) {
-            wprint(L"[+] Unpack เสร็จ! Base: 0x%llX\n", (unsigned long long)base);
-            break;
-        }
-        CloseHandle(h);
-        h = NULL;
-    }
-    if (!h || !base) {
-        wprint(L"[!] หา Base Address ไม่เจอ (รันแบบ Admin แล้วหรือยัง?)\n");
+    if (!open_target(target_exe, exe_dir, &pid, &h, &base)) {
         wprint(L"กด Enter เพื่อออก...");
         getchar();
         return 1;

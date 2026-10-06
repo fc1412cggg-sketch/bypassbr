@@ -207,6 +207,53 @@ static int sc_veh_handler(uint8_t *out, uint64_t hook_addr, uint64_t shell_addr,
     return s->pos;
 }
 
+/* TRACE VEH stub (diagnostics): single-shot per-thread hit counters.
+ * On EXCEPTION_SINGLE_STEP with a Dr0-Dr3 status bit set:
+ *   slot = bsf(Dr6 & 0xF); counters[slot]++; clear that slot's L-bit (single-shot);
+ *   Dr6 = 0; return CONTINUE_EXECUTION (re-executes the hooked instruction
+ *   normally since the breakpoint is now off). The loader re-arms periodically.
+ * Foreign single-steps (Dr6&0xF == 0) return CONTINUE_SEARCH.
+ * Uses only volatile regs (rax, rdx, r10, r11).
+ */
+static int sc_trace_veh(uint8_t *out, uint64_t counters_base) {
+    ScBuf b = { out, 0 }; ScBuf *s = &b;
+    static const uint8_t m1[] = { 0x48, 0x8B, 0x01 };                 /* mov rax, [rcx] */
+    static const uint8_t m2[] = { 0x81, 0x38, 0x04, 0x00, 0x00, 0x80 }; /* cmp dword [rax], 0x80000004 */
+    static const uint8_t m3[] = { 0x48, 0x8B, 0x51, 0x08 };           /* mov rdx, [rcx+8] */
+    static const uint8_t m4[] = { 0x4C, 0x8B, 0x52, 0x68 };           /* mov r10, [rdx+0x68] (Dr6) */
+    static const uint8_t m5[] = { 0x41, 0xF6, 0xC2, 0x0F };           /* test r10b, 0x0F */
+    static const uint8_t m6[] = { 0x41, 0x83, 0xE2, 0x0F };           /* and r10d, 0x0F */
+    static const uint8_t m7[] = { 0x41, 0x0F, 0xBC, 0xC2 };           /* bsf eax, r10d */
+    static const uint8_t m8[] = { 0x4D, 0x8D, 0x1C, 0xC3 };           /* lea r11, [r11+rax*8] */
+    static const uint8_t m9[] = { 0x49, 0xFF, 0x03 };                 /* inc qword [r11] */
+    static const uint8_t m10[] = { 0xD1, 0xE0 };                      /* shl eax, 1 */
+    static const uint8_t m11[] = { 0x48, 0x0F, 0xB3, 0x42, 0x70 };    /* btr [rdx+0x70], rax */
+    static const uint8_t m12[] = { 0x48, 0xC7, 0x42, 0x68, 0x00, 0x00, 0x00, 0x00 }; /* mov qword [rdx+0x68], 0 */
+    SC_PUT(s, m1);
+    SC_PUT(s, m2);
+    int jne1 = s->pos; sc_u8(s, 0x75); sc_u8(s, 0x00);
+    SC_PUT(s, m3);
+    SC_PUT(s, m4);
+    SC_PUT(s, m5);
+    int jz1 = s->pos; sc_u8(s, 0x74); sc_u8(s, 0x00);
+    SC_PUT(s, m6);
+    SC_PUT(s, m7);
+    SC_PUT(s, B_MOV_R11); sc_u64(s, counters_base);
+    SC_PUT(s, m8);
+    SC_PUT(s, m9);
+    SC_PUT(s, m10);
+    SC_PUT(s, m11);
+    SC_PUT(s, m12);
+    sc_u8(s, 0x31); sc_u8(s, 0xC0); /* xor eax, eax (CONTINUE_EXECUTION) */
+    sc_u8(s, 0xC3);                /* ret */
+    int search = s->pos;
+    { static const uint8_t m13[] = { 0xB8, 0x01, 0x00, 0x00, 0x00 }; SC_PUT(s, m13); } /* mov eax, 1 */
+    sc_u8(s, 0xC3);                /* ret */
+    out[jne1 + 1] = (uint8_t)(search - (jne1 + 2));
+    out[jz1 + 1] = (uint8_t)(search - (jz1 + 2));
+    return s->pos;
+}
+
 /* MSVC std::string (32 bytes). If text > 15 chars, chars (+NUL) go to longbuf
  * and the struct points at longaddr. longbuf must fit strlen(text)+1. */
 static void sc_std_string(uint8_t st[32], const char *text, uint64_t longaddr, uint8_t *longbuf) {

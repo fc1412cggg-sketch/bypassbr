@@ -27,6 +27,18 @@ LoginKeyPatcher.exe --direct any               → วิธีเก่า (แ
 LoginKeyPatcher.exe --restore                  → คืนค่า hook เดิม (สำหรับโหมด direct)
 ```
 
+## RE tools (หาจุด hook จริง — อ่านอย่างเดียว ไม่แก้โค้ด)
+
+```
+LoginKeyPatcher.exe --diag                → ชุดสำรวจครบในรันเดียว (scan calls + หาข้อความ)
+LoginKeyPatcher.exe --scan-calls 214370   → หา CALL/JMP ที่เรียก address นั้น
+LoginKeyPatcher.exe --findstr "Auth..."   → หาข้อความใน memory
+LoginKeyPatcher.exe --scan-ref 7FF6...    → หาโค้ดที่อ้างถึง address นั้น
+LoginKeyPatcher.exe --trace 214370 2194B0 → นับว่าโค้ดวิ่งผ่านจุดนั้นไหม (1-4 จุด)
+```
+
+ทุกคำสั่งจด log ต่อท้าย `patcher_log.txt` อัตโนมัติ — ส่งไฟล์นี้มาวิเคราะห์ได้เลย
+
 ## Source
 
 | ไฟล์ | คืออะไร |
