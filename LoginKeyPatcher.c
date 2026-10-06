@@ -112,7 +112,8 @@ static void usage(void) {
     wprint(L"    --scan-calls <RVA>      หา CALL/JMP ที่เรียก address นั้น (hex)\n");
     wprint(L"    --findstr <text>        หาข้อความใน memory (ASCII + UTF-16)\n");
     wprint(L"    --scan-ref <addr>       หาโค้ดที่อ้างถึง address นั้น (hex, runtime addr)\n");
-    wprint(L"    --trace <RVA..>         นับว่าโค้ดวิ่งผ่านจุดนั้นกี่ครั้ง (1-4 จุด)\n\n");
+    wprint(L"    --trace <RVA..>         นับว่าโค้ดวิ่งผ่านจุดนั้นกี่ครั้ง (1-4 จุด)\n");
+    wprint(L"    --probe                 หาว่าขั้นไหนทำ deef ตาย (เปิดใหม่ 4 รอบ, ~2 นาที)\n\n");
 }
 
 static DWORD find_pid(const char *name) {
@@ -168,6 +169,38 @@ static void strtolower_ascii(char *d, const char *s, size_t max) {
 static int target_alive(HANDLE h) {
     DWORD ec = 0;
     return GetExitCodeProcess(h, &ec) && ec == STILL_ACTIVE;
+}
+
+/* print deef's exit code after death: distinguishes clean self-exit
+ * (anti-debug / normal quit) from a crash (our bug). */
+static void report_exit(HANDLE h) {
+    DWORD ec = 0;
+    const wchar_t *why = L"";
+    if (!GetExitCodeProcess(h, &ec)) {
+        wprint(L"[*] exit code: ถามไม่ได้ err=%lu\n", GetLastError());
+        return;
+    }
+    if (ec == STILL_ACTIVE) { wprint(L"[*] exit code: ยังรันอยู่\n"); return; }
+    if (ec == 0) why = L" (ออกเองแบบสะอาด — ไม่ใช่ crash)";
+    else if (ec == 0xC0000005) why = L" (CRASH: access violation!)";
+    else if (ec == 0xC0000409) why = L" (CRASH: fail-fast!)";
+    else if (ec == 0xC0000374) why = L" (CRASH: heap corruption!)";
+    wprint(L"[*] exit code: %lu (0x%08lX)%s\n", (unsigned long)ec, (unsigned long)ec, why);
+}
+
+/* make sure no leftover deef is running (fresh slate for probe stages) */
+static void kill_deef(void) {
+    DWORD pid = find_pid("deef.exe");
+    if (!pid) return;
+    {
+        HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+        if (h) {
+            TerminateProcess(h, 0);
+            WaitForSingleObject(h, 5000);
+            CloseHandle(h);
+        }
+    }
+    Sleep(500);
 }
 
 /* identify the exact target build (file size + PE TimeDateStamp) */
@@ -678,6 +711,7 @@ static int do_stealth(HANDLE h, DWORD pid, uint64_t base,
         else
             wprint(L"[*] hook แตกทั้งหมด %llu ครั้ง\n", (unsigned long long)last_hits);
         wprint(L"[*] deef ปิดแล้ว — ปิด loader ได้\n");
+        report_exit(h);
     }
     (void)wr;
     return 0;
@@ -1153,7 +1187,12 @@ static int tool_trace(HANDLE h, DWORD pid, uint64_t base, uint64_t *rvas, int n)
     VirtualProtectEx(h, (LPVOID)(uintptr_t)mem, 4096, PAGE_EXECUTE_READ, &old);
 
     veh_handle = remote_add_veh_hijack(h, pid, veh_addr, done_addr);
-    if (!veh_handle) veh_handle = remote_add_veh_remote_thread(h, stub_addr, datab + 0x80);
+    if (veh_handle) {
+        wprint(L"[*] VEH via hijack (ไม่สร้าง thread ใหม่)\n");
+    } else {
+        veh_handle = remote_add_veh_remote_thread(h, stub_addr, datab + 0x80);
+        if (veh_handle) wprint(L"[*] VEH via CreateRemoteThread (fallback)\n");
+    }
     if (!veh_handle) {
         wprint(L"[!] ติดตั้ง VEH ไม่สำเร็จ\n");
         return 1;
@@ -1189,6 +1228,7 @@ static int tool_trace(HANDLE h, DWORD pid, uint64_t base, uint64_t *rvas, int n)
         for (i = 0; i < n; i++)
             wprint(L"  0x%llX=%llu", (unsigned long long)rvas[i], (unsigned long long)last[i]);
         wprint(L"\n[*] deef ปิดแล้ว — ปิด tracer ได้\n");
+        report_exit(h);
     }
     return 0;
 }
@@ -1200,6 +1240,111 @@ static void tool_diag(HANDLE h, uint64_t base, uint64_t size) {
     tool_scan_calls(h, base, size, RVA_MAIN_SCREEN);
     tool_findstr(h, base, size, "Authentication failed.");
     wprint(L"===== END DIAG =====\n");
+}
+
+/* ---- --probe: find which step kills deef (4 fresh launches, back-to-back) ----
+ * S0: launch + unpack-wait only (touch nothing)
+ * S1: + install VEH (no breakpoints armed)
+ * S2: + arm a dead address (RVA 0 = header bytes, never executes)
+ * S3: + arm RVA 0x214370 (the real suspect) */
+static uint64_t probe_install_veh(HANDLE h, DWORD pid, uint64_t *addrs, int n,
+                                  uint64_t *out_mem, uint64_t *out_datab) {
+    uint64_t mem, datab, veh_addr, done_addr, stub_addr;
+    uint8_t veh[128], stub[64];
+    int veh_len, stub_len;
+    DWORD old = 0;
+    uint64_t vh;
+    mem = (uint64_t)(uintptr_t)VirtualAllocEx(h, NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    datab = (uint64_t)(uintptr_t)VirtualAllocEx(h, NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!mem || !datab) {
+        wprint(L"[!] VirtualAllocEx ล้มเหลว err=%lu\n", GetLastError());
+        return 0;
+    }
+    veh_addr = mem + L_VEH; done_addr = mem + L_DONE; stub_addr = mem + L_RTSTUB;
+    veh_len = sc_trace_veh(veh, datab, datab + 0x40);
+    wpm(h, datab + 0x40, addrs, (SIZE_T)(n * 8));
+    {
+        FARPROC addveh = GetProcAddress(GetModuleHandleA("kernel32.dll"), "AddVectoredExceptionHandler");
+        stub_len = build_rtstub(stub, veh_addr, (uint64_t)(uintptr_t)addveh, datab + 0x80);
+    }
+    wpm(h, veh_addr, veh, veh_len);
+    {
+        uint8_t doneb[2] = { 0xEB, 0xFE };
+        wpm(h, done_addr, doneb, 2);
+    }
+    wpm(h, stub_addr, stub, stub_len);
+    VirtualProtectEx(h, (LPVOID)(uintptr_t)mem, 4096, PAGE_EXECUTE_READ, &old);
+    vh = remote_add_veh_hijack(h, pid, veh_addr, done_addr);
+    if (vh) wprint(L"[*] VEH via hijack handle=0x%llX\n", (unsigned long long)vh);
+    else {
+        vh = remote_add_veh_remote_thread(h, stub_addr, datab + 0x80);
+        if (vh) wprint(L"[*] VEH via CreateRemoteThread handle=0x%llX\n", (unsigned long long)vh);
+    }
+    *out_mem = mem;
+    *out_datab = datab;
+    (void)veh_len; (void)stub_len;
+    return vh;
+}
+
+static int probe_wait(HANDLE h, int secs, const wchar_t *tag) {
+    int i;
+    for (i = 0; i < secs * 2; i++) {
+        Sleep(500);
+        if (!target_alive(h)) {
+            wprint(L"[DIED] %s: deef ตายหลัง ~%d วินาที! ", tag, (i + 1) / 2);
+            report_exit(h);
+            return 0;
+        }
+    }
+    wprint(L"[LIVE] %s: รอดครบ %d วินาที\n", tag, secs);
+    return 1;
+}
+
+static int tool_probe(const char *target_exe, const char *exe_dir) {
+    int live[4] = { 0, 0, 0, 0 };
+    int opened[4] = { 0, 0, 0, 0 };
+    int s;
+    static const wchar_t *tags[4] = {
+        L"S0: แค่เปิดโปรแกรม (ไม่แตะอะไรเลย)",
+        L"S1: +ติดตั้ง VEH (ยังไม่ arm)",
+        L"S2: +arm จุดตาย (RVA 0 — ไม่มีทางแตก)",
+        L"S3: +arm 0x214370 (จุดสงสัย)"
+    };
+    wprint(L"[*] probe: เปิด deef ใหม่ 4 รอบ รอบละขั้น — ดูว่ารอบไหนตาย (ใช้เวลา ~2 นาที)\n");
+    for (s = 0; s < 4; s++) {
+        DWORD pid = 0;
+        HANDLE h = NULL;
+        uint64_t base = 0;
+        kill_deef();
+        wprint(L"\n===== PROBE %d/4 =====\n", s);
+        if (!open_target(target_exe, exe_dir, &pid, &h, &base)) {
+            wprint(L"[DIED] S%d: เปิด/wait ไม่ผ่านตั้งแต่ต้น\n", s);
+            continue;
+        }
+        opened[s] = 1;
+        if (s == 0) {
+            live[s] = probe_wait(h, 15, tags[s]);
+        } else {
+            uint64_t mem = 0, datab = 0, vh;
+            uint64_t addrs[1];
+            addrs[0] = base + (s == 3 ? RVA_LOGIN_SCREEN : 0);
+            vh = probe_install_veh(h, pid, addrs, 1, &mem, &datab);
+            if (!vh) {
+                wprint(L"[DIED] S%d: ติดตั้ง VEH ไม่สำเร็จ\n", s);
+                CloseHandle(h);
+                continue;
+            }
+            if (s >= 2) force_arm_all(pid, addrs, 1);
+            live[s] = probe_wait(h, 15, tags[s]);
+        }
+        CloseHandle(h);
+    }
+    kill_deef();
+    wprint(L"\n===== PROBE SUMMARY =====\n");
+    for (s = 0; s < 4; s++)
+        wprint(L"  S%d: %s\n", s, !opened[s] ? L"เปิดไม่ติด" : live[s] ? L"รอด" : L"ตาย");
+    wprint(L"[*] ส่งผล 4 บรรทัดนี้มา (ขั้นแรกที่ขึ้นว่า \"ตาย\" = ตัวฆ่า)\n");
+    return 0;
 }
 
 /* ---------------- main ---------------- */
@@ -1233,7 +1378,7 @@ int main(int argc, char **argv) {
     }
 
     wprint(L"=================================================\n");
-    wprint(L"     LOGIN KEY PATCHER v2.5 (ENTRY-REDIRECT)      \n");
+    wprint(L"     LOGIN KEY PATCHER v2.6 (DIAG BUILD)          \n");
     wprint(L"=================================================\n");
 
     GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir));
@@ -1244,6 +1389,13 @@ int main(int argc, char **argv) {
 
     /* ---- RE tool modes ---- */
     if (argi < argc && strncmp(argv[argi], "--", 2) == 0) {
+        if (strcmp(argv[argi], "--probe") == 0) {
+            int trc;
+            print_target_identity(target_exe);
+            trc = tool_probe(target_exe, exe_dir);
+            if (g_log) fclose(g_log);
+            return trc;
+        }
         if (strcmp(argv[argi], "--scan-calls") == 0 || strcmp(argv[argi], "--findstr") == 0 ||
             strcmp(argv[argi], "--scan-ref") == 0 || strcmp(argv[argi], "--trace") == 0 ||
             strcmp(argv[argi], "--diag") == 0) {
