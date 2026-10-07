@@ -1247,31 +1247,29 @@ static void tool_diag(HANDLE h, uint64_t base, uint64_t size) {
     wprint(L"===== END DIAG =====\n");
 }
 
-/* ---- --probe v2.12: หาวิธี "ทำให้โค้ดสะดุด" ที่ Enigma จับไม่ได้ ----
- * v2.11 พบ: วาง hardware breakpoint แล้ว deef ตายด้วย exit code 0xDEADC0DE
- *           (รหัสนี้ไม่ใช่ของ Windows = Enigma ตั้งใจเขียนเอง → มันจับ Dr register ได้)
- * ก็เลยต้องหาวิธีอื่นในการทำให้โค้ดสะดุดตรงจุด login โดยใช้ VEH ตัวเดียวกัน:
- *   A: VEH เฉย ๆ (ไม่มีตัวสะดุด) + ยิงจุดพังทดสอบตอนท้าย → ดูว่า VEH อยู่รอดไหม
- *   B: VEH + เขียน int3 (0xCC) 1 ไบต์ ที่ 0x214370
- *   C: VEH + ตั้ง PAGE_GUARD บนเพจของ 0x214370 (ไม่แก้โค้ดเลย)
- *   D: วาง hardware breakpoint เฉย ๆ โดยไม่มี VEH (control — ดูว่ารหัสตายเป็นอะไร) */
-
-static const char *NTDLL_HOOKS[] = {
-    "RtlAddVectoredExceptionHandler", "RtlRemoveVectoredExceptionHandler",
-    "RtlDispatchException", "KiUserExceptionDispatcher",
-    "RtlEncodePointer", "RtlDecodePointer",
-    "NtSetContextThread", "NtGetContextThread", "NtContinue",
-    "NtProtectVirtualMemory", "NtWriteVirtualMemory", "NtReadVirtualMemory",
-    "NtQueryInformationProcess", "NtSetInformationProcess",
-    "NtCreateThreadEx", "NtSuspendThread", "NtResumeThread",
-    "NtTerminateProcess", "RtlExitUserProcess", "LdrLoadDll",
-    "NtWaitForSingleObject", "NtDelayExecution", "NtQuerySystemInformation",
-    "NtQueueApcThread", "NtRaiseException", "RtlUserThreadStart",
-    "NtSetInformationThread", "NtQueryVirtualMemory", "NtAllocateVirtualMemory",
-    "NtFreeVirtualMemory", "NtGetTickCount", NULL
-};
+/* ---- --probe v2.13: ทางผ่านเดียวที่เหลือ = PAGE_GUARD ----
+ * v2.12 สรุป:  VEH ทำงานแล้ว (เห็น exception 12 ครั้ง — Enigma ใช้ #DB เองด้วย)
+ *              hardware breakpoint → Enigma จับได้ → exit 0xDEADC0DE (8.8วิ)
+ *              int3 (แก้โค้ด 1 ไบต์) → Enigma จับได้ → exit 0xDEADC0DE (10.3วิ)
+ *              PAGE_GUARD → Enigma **ไม่**จับ (ตายเพราะ exception เราไม่รับเอง 6.6วิ)
+ * ก็เลยใช้ PAGE_GUARD เป็นตัวสะดุดแทน:
+ *   G0 = PAGE_GUARD + handler ครบชุด (รับทุกการเข้าถึงในเพจ + ตั้ง TF + ตั้ง guard ใหม่ผ่าน syscall ตรง)
+ *   G1 = PAGE_GUARD แบบยิงครั้งเดียว (ไม่มี TF/syscall — ตัวสำรอง) */
 
 typedef struct { uint64_t code; uint64_t addr; } ExcEnt;
+
+/* ดูเลข syscall จากโค้ดสะอาดของเรา: 4C 8B D1 | B8 <num> */
+static uint32_t get_syscall_no(const char *name) {
+    FARPROC f = GetProcAddress(GetModuleHandleA("ntdll.dll"), name);
+    uint8_t *b = (uint8_t *)f;
+    uint32_t n = 0;
+    if (!f) return 0x50;
+    if (b[0] == 0x4C && b[1] == 0x8B && b[2] == 0xD1 && b[3] == 0xB8) {
+        memcpy(&n, b + 4, 4);
+        return n;
+    }
+    return 0x50;
+}
 
 static uint64_t probe_alloc2(HANDLE h, uint64_t *out_mem, uint64_t *out_datab) {
     uint64_t mem = (uint64_t)(uintptr_t)VirtualAllocEx(h, NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -1307,72 +1305,6 @@ static uint64_t install_veh(HANDLE h, uint64_t handler, uint64_t mem, uint64_t d
     return vh;
 }
 
-static void selftest_fault(HANDLE h, uint64_t mem) {
-    uint8_t stub[8];
-    HANDLE rt;
-    stub[0] = 0x31; stub[1] = 0xC0;
-    stub[2] = 0x89; stub[3] = 0x00;
-    stub[4] = 0xC3;
-    wpm(h, mem + 0x60, stub, 5);
-    rt = CreateRemoteThread(h, NULL, 0, (LPTHREAD_START_ROUTINE)(uintptr_t)(mem + 0x60), NULL, 0, NULL);
-    if (rt) {
-        DWORD ec = 0;
-        WaitForSingleObject(rt, 5000);
-        GetExitCodeThread(rt, &ec);
-        wprint(L"[*]   thread ทดสอบจบ exit=0x%lX %s\n", (unsigned long)ec,
-               ec == 0 ? L"(รอด — handler ซ่อมให้สำเร็จ)" : L"(ตาย — handler ไม่ทำงาน)");
-        CloseHandle(rt);
-    }
-}
-
-static void read_exc_log(HANDLE h, uint64_t datab) {
-    uint64_t total = 0;
-    ExcEnt ring[32];
-    int k, newest;
-    memset(ring, 0, sizeof(ring));
-    if (!datab) return;
-    rpm(h, datab + 0x100, &total, 8);
-    rpm(h, datab + 0x200, ring, sizeof(ring));
-    wprint(L"[*]   exception log: เห็นทั้งหมด %llu ครั้ง\n", (unsigned long long)total);
-    if (!total) { wprint(L"[*]   ไม่มี exception เลย → handler ไม่ได้ถูกเรียก\n"); return; }
-    newest = (int)((total - 1) & 31);
-    for (k = 2; k >= 0; k--) {
-        int idx = (newest - k + 32) & 31;
-        if (total < (uint64_t)(k + 1)) continue;
-        wprint(L"      #%llu code=0x%08X addr=0x%llX\n",
-               (unsigned long long)(total - k),
-               (unsigned)(ring[idx].code & 0xFFFFFFFFu),
-               (unsigned long long)ring[idx].addr);
-    }
-}
-
-static void scan_module_hooks(HANDLE h, const char *mod, const char *const *names) {
-    HMODULE m = GetModuleHandleA(mod);
-    uint64_t omb, tmb;
-    int i;
-    if (!m) return;
-    omb = (uint64_t)(uintptr_t)m;
-    tmb = get_module_base(h, mod);
-    if (!tmb) return;
-    if (omb != tmb) wprint(L"[*] %S base ไม่ตรงกัน เรา=0x%llX deef=0x%llX\n",
-                           mod, (unsigned long long)omb, (unsigned long long)tmb);
-    for (i = 0; names[i]; i++) {
-        uint8_t ours[16], theirs[16];
-        FARPROC f = GetProcAddress(m, names[i]);
-        int k;
-        if (!f) continue;
-        memcpy(ours, f, 16);
-        if (!rpm(h, tmb + ((uint64_t)(uintptr_t)f - omb), theirs, 16)) continue;
-        if (memcmp(ours, theirs, 16) == 0) continue;
-        wprint(L"    [HOOKED] %S\n", names[i]);
-        wprint(L"        เรา  : ");
-        for (k = 0; k < 16; k++) wprint(L"%02X ", ours[k]);
-        wprint(L"\n        deef : ");
-        for (k = 0; k < 16; k++) wprint(L"%02X ", theirs[k]);
-        wprint(L"\n");
-    }
-}
-
 struct WinFind { DWORD pid; HWND hwnd; char title[256]; };
 static BOOL CALLBACK enum_win_cb(HWND hw, LPARAM lp) {
     struct WinFind *w = (struct WinFind *)lp;
@@ -1389,8 +1321,8 @@ static BOOL CALLBACK enum_win_cb(HWND hw, LPARAM lp) {
     return FALSE;
 }
 
-/* ดูผล: นับ hits, แจ้งชื่อหน้าต่าง, รายงานการตาย */
-static int watch_run(HANDLE h, DWORD pid, int secs, uint64_t counter, const wchar_t *tag) {
+static int watch_run(HANDLE h, DWORD pid, int secs, uint64_t counter, const wchar_t *tag,
+                     uint64_t page, DWORD orig_prot) {
     int i;
     uint64_t hits = 0, shown = 0;
     for (i = 0; i < secs * 10; i++) {
@@ -1403,11 +1335,17 @@ static int watch_run(HANDLE h, DWORD pid, int secs, uint64_t counter, const wcha
         if (counter) {
             rpm(h, counter, &hits, 8);
             if (hits != shown) {
-                wprint(L"[HIT] จุด login สะดุดแล้ว รวม %llu ครั้ง\n", (unsigned long long)hits);
+                wprint(L"[HIT] จุด login สะดุดแล้ว! รวม %llu ครั้ง\n", (unsigned long long)hits);
                 shown = hits;
             }
+            if (hits && page) {   /* ผ่านแล้ว — เอาสิทธิ์เพจคืนให้เหมือนเดิม */
+                DWORD oldp = 0;
+                VirtualProtectEx(h, (LPVOID)(uintptr_t)page, 0x1000, orig_prot, &oldp);
+                wprint(L"[*]   คืนสิทธิ์เพจเป็นปกติแล้ว (กันความช้า)\n");
+                page = 0;
+            }
         }
-        if (i % 25 == 24) {
+        if (i % 20 == 19) {
             struct WinFind w;
             wchar_t wt[256];
             w.pid = pid; w.hwnd = NULL; w.title[0] = 0;
@@ -1422,105 +1360,68 @@ static int watch_run(HANDLE h, DWORD pid, int secs, uint64_t counter, const wcha
 }
 
 static int tool_probe(const char *target_exe, const char *exe_dir) {
-    int live[4] = { 0, 0, 0, 0 };
-    int opened[4] = { 0, 0, 0, 0 };
+    int live[2] = { 0, 0 };
+    int opened[2] = { 0, 0 };
     int s;
-    static const wchar_t *tags[4] = {
-        L"A VEH เฉย ๆ (ไม่มีตัวสะดุด)",
-        L"B VEH + int3 (0xCC) ที่จุด login",
-        L"C VEH + PAGE_GUARD (ไม่แก้โค้ด)",
-        L"D hardware breakpoint เฉย ๆ (ไม่มี VEH)"
+    static const wchar_t *tags[2] = {
+        L"G0  PAGE_GUARD + ตั้ง guard ใหม่ผ่าน syscall ตรง",
+        L"G1  PAGE_GUARD ยิงครั้งเดียว (ตัวสำรอง)"
     };
-    wprint(L"[*] probe v2.12: หาวิธีทำให้โค้ดสะดุดที่ Enigma จับไม่ได้ (4 รอบ)\n");
-    for (s = 0; s < 4; s++) {
+    wprint(L"[*] probe v2.13: ใช้ PAGE_GUARD เป็นตัวสะดุด (ไม่แตะโค้ด ไม่แตะ Dr)\n");
+    for (s = 0; s < 2; s++) {
         DWORD pid = 0;
         HANDLE h = NULL;
-        uint64_t base = 0;
-        uint64_t hook, mem = 0, datab = 0;
+        uint64_t base = 0, hook, mem = 0, datab = 0;
+        uint64_t page, main_screen, code_addr, user_str, key_str, user_lng, key_lng;
+        uint64_t counter, scratch, handler;
+        uint8_t veh[320], code[512], st[32], longbuf[256];
+        int n;
+        DWORD oldp = 0;
+        uint32_t sysno = get_syscall_no("NtProtectVirtualMemory");
         kill_deef();
-        wprint(L"\n===== PROBE %d/4 =====\n", s);
+        wprint(L"\n===== PROBE %d/2 =====\n", s);
         if (!open_target(target_exe, exe_dir, &pid, &h, &base)) {
             wprint(L"[DIED] ขั้น %d: เปิด/wait ไม่ผ่านตั้งแต่ต้น\n", s);
             continue;
         }
         opened[s] = 1;
         hook = base + RVA_LOGIN_SCREEN;
+        page = hook & ~0xFFFULL;
         if (!probe_alloc2(h, &mem, &datab)) { CloseHandle(h); continue; }
+        main_screen = base + RVA_MAIN_SCREEN;
+        code_addr = mem + L_CODE; user_str = mem + L_USER_STR; key_str = mem + L_KEY_STR;
+        user_lng = mem + L_USER_LONG; key_lng = mem + L_KEY_LONG;
+        counter = datab + 0x100; scratch = datab + 0x300; handler = mem + 0x500;
 
-        if (s == 0) {
-            uint8_t veh[160];
-            int n = sc_test_veh2(veh, datab, mem + 0x62);
-            wpm(h, mem + L_VEH, veh, (SIZE_T)n);
-            if (!install_veh(h, mem + L_VEH, mem, datab)) { CloseHandle(h); continue; }
-            /* รอดูว่า Enigma จะจัดการ VEH เราไหม แล้วค่อยทดสอบตอนท้าย */
-            {
-                int i;
-                for (i = 0; i < 150; i++) {
-                    Sleep(100);
-                    if (!target_alive(h)) {
-                        wprint(L"[DIED] %s: ตายหลัง ~%.1f วินาที! ", tags[s], (i + 1) * 0.1);
-                        report_exit(h);
-                        break;
-                    }
-                }
-                if (!target_alive(h)) { CloseHandle(h); continue; }
-                wprint(L"[*]   ผ่าน 15 วิโดยยังมีชีวิต — เช็ค hook ของ Enigma ตอนนี้:\n");
-                scan_module_hooks(h, "ntdll.dll", NTDLL_HOOKS);
-                wprint(L"[*]   ยิงจุดพังทดสอบ...\n");
-                selftest_fault(h, mem);
-                read_exc_log(h, datab);
-            }
-            live[s] = watch_run(h, pid, 5, 0, tags[s]);
-        } else if (s == 3) {
-            int armed = arm_threads(pid, hook, 0);
-            wprint(L"[*]   วาง hardware breakpoint %d threads (ไม่มี VEH เลย)\n", armed);
-            live[s] = watch_run(h, pid, 20, 0, tags[s]);
-        } else {
-            uint64_t main_screen = base + RVA_MAIN_SCREEN;
-            uint64_t code_addr = mem + L_CODE, user_str = mem + L_USER_STR;
-            uint64_t key_str = mem + L_KEY_STR, user_lng = mem + L_USER_LONG;
-            uint64_t key_lng = mem + L_KEY_LONG, counter = datab + 0x100;
-            uint8_t veh[160], code[512], st[32], longbuf[256];
-            int n;
-            DWORD old = 0;
-            n = sc_any_veh(veh, hook, code_addr, counter);
-            wpm(h, mem + L_VEH, veh, (SIZE_T)n);
-            n = sc_build_entry(code, main_screen, user_str, key_str);
-            wpm(h, code_addr, code, (SIZE_T)n);
-            sc_std_string(st, "VIP User", user_lng, longbuf);
-            wpm(h, user_str, st, 32);
-            sc_std_string(st, "ARENA-2026-FREE", key_lng, longbuf);
-            wpm(h, key_str, st, 32);
-            if (s == 1) {
-                uint8_t orig = 0, cc = 0xCC;
-                rpm(h, hook, &orig, 1);
-                VirtualProtectEx(h, (LPVOID)(uintptr_t)(hook & ~0xFFFULL), 0x1000,
-                                 PAGE_EXECUTE_READWRITE, &old);
-                wpm(h, hook, &cc, 1);
-                VirtualProtectEx(h, (LPVOID)(uintptr_t)(hook & ~0xFFFULL), 0x1000, old, &old);
-                wprint(L"[*]   เขียน int3 ทับ 1 ไบต์ที่ 0x%llX (ของเดิม=0x%02X)\n",
-                       (unsigned long long)hook, (unsigned)orig);
-            } else {
-                uint64_t page = hook & ~0xFFFULL;
-                if (!VirtualProtectEx(h, (LPVOID)(uintptr_t)page, 0x1000,
-                                      PAGE_EXECUTE_READ | PAGE_GUARD, &old))
-                    wprint(L"[!]   ตั้ง PAGE_GUARD ไม่ได้ err=%lu\n", GetLastError());
-                else
-                    wprint(L"[*]   ตั้ง PAGE_GUARD บนเพจ 0x%llX แล้ว (ไม่แตะโค้ด)\n",
-                           (unsigned long long)page);
-            }
-            if (!install_veh(h, mem + L_VEH, mem, datab)) { CloseHandle(h); continue; }
-            live[s] = watch_run(h, pid, 20, counter, tags[s]);
+        n = sc_guard_veh(veh, page, page + 0x1000, hook, code_addr, counter,
+                         scratch, sysno, s == 0 ? 1 : 0);
+        wpm(h, handler, veh, (SIZE_T)n);
+        n = sc_build_entry(code, main_screen, user_str, key_str);
+        wpm(h, code_addr, code, (SIZE_T)n);
+        sc_std_string(st, "VIP User", user_lng, longbuf);
+        wpm(h, user_str, st, 32);
+        sc_std_string(st, "ARENA-2026-FREE", key_lng, longbuf);
+        wpm(h, key_str, st, 32);
+        wprint(L"[*]   handler %d ไบต์ @0x%llX (syscall NtProtectVirtualMemory=#0x%lX)\n",
+               n, (unsigned long long)handler, (unsigned long)sysno);
+        /* ตั้ง PAGE_GUARD บนเพจของจุด login (ไม่แตะโค้ดเลย) */
+        if (!VirtualProtectEx(h, (LPVOID)(uintptr_t)page, 0x1000,
+                              PAGE_EXECUTE_READ | PAGE_GUARD, &oldp)) {
+            wprint(L"[!]   ตั้ง PAGE_GUARD ไม่ได้ err=%lu\n", GetLastError());
+            CloseHandle(h);
+            continue;
         }
+        wprint(L"[*]   ตั้ง PAGE_GUARD บนเพจ 0x%llX แล้ว (สิทธิ์เดิม=0x%lX)\n",
+               (unsigned long long)page, (unsigned long)oldp);
+        if (!install_veh(h, handler, mem, datab)) { CloseHandle(h); continue; }
+        live[s] = watch_run(h, pid, 22, counter, tags[s], page, oldp);
         CloseHandle(h);
     }
     kill_deef();
     wprint(L"\n===== PROBE SUMMARY =====\n");
-    for (s = 0; s < 4; s++)
-        wprint(L"  %s: %s\n",
-               s == 0 ? L"A" : (s == 1 ? L"B" : (s == 2 ? L"C" : L"D")),
-               !opened[s] ? L"เปิดไม่ติด" : live[s] ? L"รอด" : L"ตาย");
-    wprint(L"[*] ส่งผล 4 บรรทัด + บรรทัด exit code + [HOOKED] + exception log มา\n");
+    for (s = 0; s < 2; s++)
+        wprint(L"  G%d: %s\n", s, !opened[s] ? L"เปิดไม่ติด" : live[s] ? L"รอด" : L"ตาย");
+    wprint(L"[*] ถ้ามี [HIT] + รอด = ข้าม login สำเร็จ → รัน LoginKeyPatcher.exe any ใช้งานจริงได้เลย\n");
     return 0;
 }
 
@@ -1555,7 +1456,7 @@ int main(int argc, char **argv) {
     }
 
     wprint(L"=================================================\n");
-    wprint(L"     LOGIN KEY PATCHER v2.12 (TRIGGER HUNT)          \n");
+    wprint(L"     LOGIN KEY PATCHER v2.13 (GUARD PAGE)          \n");
     wprint(L"=================================================\n");
 
     GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir));
