@@ -415,90 +415,99 @@ static int sc_any_veh(uint8_t *out, uint64_t trigger_addr, uint64_t shell_addr,
     return s->pos;
 }
 
-/* GUARD-PAGE redirect handler (Enigma-safe: ไม่แตะโค้ด ไม่แตะ Dr register)
- *  ตั้ง PAGE_GUARD บนเพจที่มีจุด login → การเข้าถึงเพจนั้น (แม้แต่การอ่านคำสั่ง)
- *  จะทำให้เกิด EXCEPTION_GUARD_PAGE (0x80000001) ซึ่ง VEH เราได้ก่อน
- *   - ถ้าเป็นจุด login เป๊ะ -> กระโดดไปทำ shellcode ข้าม login เลย
- *   - ถ้าเป็นจุดอื่นในเพจเดียวกัน -> ปล่อยผ่าน (คืน CONTINUE_EXECUTION)
- *     แล้วเปิด TF (trap flag) ไว้ พอคำสั่งนั้นทำงานเสร็จจะเกิด #DB
- *     ตอนนั้นค่อยตั้ง PAGE_GUARD กลับ (กันการวนลูปแบบไม่รู้จบ)
- *  การตั้ง guard ใหม่ทำผ่าน **syscall ตรง** (ข้าม hook ของ Enigma ใน ntdll)
- *  scratch: +0x00 เก็บ Context, +0x08 เก็บ ExceptionAddress, +0x10 เก็บ old protect
+/* GUARD-PAGE redirect handler v2 (Enigma-safe: ไม่แตะโค้ด ไม่แตะ Dr register)
+ *  + บันทึก exception ทุกตัวลง ring (log_total/log_ring) เพื่อดูว่ามันเห็นอะไรบ้าง
+ *  ตั้ง PAGE_GUARD บนเพจที่มีจุด login → การเข้าถึงเพจนั้นจะทำให้เกิด
+ *  EXCEPTION_GUARD_PAGE (0x80000001) ซึ่ง VEH เราได้ก่อน
+ *   - ถ้าเป็นจุด login เป๊ะ -> กระโดดไปทำ shellcode ข้าม login เลย (นับ hits)
+ *   - ถ้าเป็นจุดอื่นในเพจเดียวกัน -> ปล่อยผ่าน แล้วเปิด TF ให้สะดุดหลังคำสั่งนั้น
+ *     แล้วค่อยตั้ง PAGE_GUARD กลับผ่าน **syscall ตรง** (ข้าม hook ของ Enigma)
+ *  scratch: +0x00 Context, +0x08 ExceptionAddress, +0x10 old protect
  *  mode 0 = ยิงครั้งเดียว (ไม่ตั้ง TF ไม่ตั้ง guard ใหม่) */
 static int sc_guard_veh(uint8_t *out, uint64_t page, uint64_t page_end,
                         uint64_t trigger, uint64_t shell, uint64_t counter,
-                        uint64_t scratch, uint32_t syscall_no, int mode) {
+                        uint64_t scratch, uint64_t log_total, uint64_t log_ring,
+                        uint32_t syscall_no, int mode) {
     ScBuf b = { out, 0 }; ScBuf *s = &b;
     int p_je_step = -1, p_je_guard = -1, p_jmp_search = -1;
-    int p_jb1 = -1, p_jae1 = -1, p_je_hit = -1;
-    int p_jz_step = -1, guard_at, hit_at, step_at, search_at, i;
+    int p_jb1 = -1, p_jae1 = -1, p_je_hit = -1, p_jz_step = -1;
+    int guard_at, hit_at, step_at, search_at, i;
     int fixups[8][2]; int nfix = 0;
 
     sc_u8(s, 0x48); sc_u8(s, 0x8B); sc_u8(s, 0x01);       /* mov rax,[rcx] */
     sc_u8(s, 0x48); sc_u8(s, 0x8B); sc_u8(s, 0x51); sc_u8(s, 0x08); /* mov rdx,[rcx+8] */
     sc_u8(s, 0x44); sc_u8(s, 0x8B); sc_u8(s, 0x00);       /* mov r8d,[rax] */
     sc_u8(s, 0x4C); sc_u8(s, 0x8B); sc_u8(s, 0x48); sc_u8(s, 0x10); /* mov r9,[rax+0x10] */
+    /* --- log: ring[(total&31)] = {code, addr}; total++ (ใช้ r10/r11) --- */
+    sc_u8(s, 0x49); sc_u8(s, 0xBA); sc_u64(s, log_total); /* mov r10, log_total */
+    sc_u8(s, 0x45); sc_u8(s, 0x8B); sc_u8(s, 0x1A);       /* mov r11d,[r10] */
+    sc_u8(s, 0x41); sc_u8(s, 0x83); sc_u8(s, 0xE3); sc_u8(s, 0x1F); /* and r11d,31 */
+    sc_u8(s, 0x41); sc_u8(s, 0xC1); sc_u8(s, 0xE3); sc_u8(s, 0x04); /* shl r11d,4 */
+    sc_u8(s, 0x49); sc_u8(s, 0xBA); sc_u64(s, log_ring);  /* mov r10, log_ring */
+    sc_u8(s, 0x4F); sc_u8(s, 0x8D); sc_u8(s, 0x1C); sc_u8(s, 0x1A); /* lea r11,[r10+r11] */
+    sc_u8(s, 0x45); sc_u8(s, 0x89); sc_u8(s, 0x03);       /* mov [r11],r8d */
+    sc_u8(s, 0x4D); sc_u8(s, 0x89); sc_u8(s, 0x4B); sc_u8(s, 0x08); /* mov [r11+8],r9 */
+    sc_u8(s, 0x49); sc_u8(s, 0xBA); sc_u64(s, log_total); /* mov r10, log_total */
+    sc_u8(s, 0x49); sc_u8(s, 0xFF); sc_u8(s, 0x02);       /* inc qword [r10] */
+    /* --- save context/addr for the syscall path --- */
     sc_u8(s, 0x48); sc_u8(s, 0xB8); sc_u64(s, scratch);   /* mov rax, scratch */
     sc_u8(s, 0x48); sc_u8(s, 0x89); sc_u8(s, 0x50); sc_u8(s, 0x00); /* mov [rax],rdx */
     sc_u8(s, 0x4C); sc_u8(s, 0x89); sc_u8(s, 0x48); sc_u8(s, 0x08); /* mov [rax+8],r9 */
-    /* single step? */
     sc_u8(s, 0x41); sc_u8(s, 0x81); sc_u8(s, 0xF8); sc_u32(s, 0x80000004u);
     sc_u8(s, 0x0F); sc_u8(s, 0x84); p_je_step = s->pos; sc_u32(s, 0);
-    /* guard page? */
     sc_u8(s, 0x41); sc_u8(s, 0x81); sc_u8(s, 0xF8); sc_u32(s, 0x80000001u);
     sc_u8(s, 0x0F); sc_u8(s, 0x84); p_je_guard = s->pos; sc_u32(s, 0);
-    sc_u8(s, 0xE9); p_jmp_search = s->pos; sc_u32(s, 0);  /* jmp search */
+    sc_u8(s, 0xE9); p_jmp_search = s->pos; sc_u32(s, 0);
 
     guard_at = s->pos;
-    sc_u8(s, 0x48); sc_u8(s, 0xB8); sc_u64(s, page);      /* mov rax, page */
-    sc_u8(s, 0x49); sc_u8(s, 0x39); sc_u8(s, 0xC1);       /* cmp r9, rax */
+    sc_u8(s, 0x48); sc_u8(s, 0xB8); sc_u64(s, page);
+    sc_u8(s, 0x49); sc_u8(s, 0x39); sc_u8(s, 0xC1);
     sc_u8(s, 0x0F); sc_u8(s, 0x82); p_jb1 = s->pos; sc_u32(s, 0);
-    sc_u8(s, 0x48); sc_u8(s, 0xB8); sc_u64(s, page_end);  /* mov rax, page_end */
+    sc_u8(s, 0x48); sc_u8(s, 0xB8); sc_u64(s, page_end);
     sc_u8(s, 0x49); sc_u8(s, 0x39); sc_u8(s, 0xC1);
     sc_u8(s, 0x0F); sc_u8(s, 0x83); p_jae1 = s->pos; sc_u32(s, 0);
-    sc_u8(s, 0x48); sc_u8(s, 0xB8); sc_u64(s, trigger);   /* mov rax, trigger */
+    sc_u8(s, 0x48); sc_u8(s, 0xB8); sc_u64(s, trigger);
     sc_u8(s, 0x49); sc_u8(s, 0x39); sc_u8(s, 0xC1);
     sc_u8(s, 0x0F); sc_u8(s, 0x84); p_je_hit = s->pos; sc_u32(s, 0);
-    if (mode) {                                            /* or [rdx+0x44], 0x100 (TF) */
+    if (mode) {
         sc_u8(s, 0x81); sc_u8(s, 0x4A); sc_u8(s, 0x44);
         sc_u8(s, 0x00); sc_u8(s, 0x01); sc_u8(s, 0x00); sc_u8(s, 0x00);
     }
-    sc_u8(s, 0x31); sc_u8(s, 0xC0); sc_u8(s, 0xC3);        /* xor eax,eax; ret */
+    sc_u8(s, 0x31); sc_u8(s, 0xC0); sc_u8(s, 0xC3);
 
     hit_at = s->pos;
-    sc_u8(s, 0x48); sc_u8(s, 0xB8); sc_u64(s, shell);      /* mov rax, shell */
+    sc_u8(s, 0x48); sc_u8(s, 0xB8); sc_u64(s, shell);
     sc_u8(s, 0x48); sc_u8(s, 0x89); sc_u8(s, 0x82);
-    sc_u8(s, 0xF8); sc_u8(s, 0x00); sc_u8(s, 0x00); sc_u8(s, 0x00); /* mov [rdx+0xF8],rax */
+    sc_u8(s, 0xF8); sc_u8(s, 0x00); sc_u8(s, 0x00); sc_u8(s, 0x00);
     sc_u8(s, 0x48); sc_u8(s, 0xB8); sc_u64(s, counter);
-    sc_u8(s, 0x48); sc_u8(s, 0xFF); sc_u8(s, 0x00);        /* inc qword [rax] */
+    sc_u8(s, 0x48); sc_u8(s, 0xFF); sc_u8(s, 0x00);
     sc_u8(s, 0x31); sc_u8(s, 0xC0); sc_u8(s, 0xC3);
 
     step_at = s->pos;
     if (!mode) {
-        sc_u8(s, 0xE9); p_jz_step = s->pos; sc_u32(s, 0); /* jmp search */
+        sc_u8(s, 0xE9); p_jz_step = s->pos; sc_u32(s, 0);
     } else {
         sc_u8(s, 0xF7); sc_u8(s, 0x42); sc_u8(s, 0x68);
-        sc_u8(s, 0x00); sc_u8(s, 0x40); sc_u8(s, 0x00); sc_u8(s, 0x00); /* test [rdx+0x68],0x4000 */
+        sc_u8(s, 0x00); sc_u8(s, 0x40); sc_u8(s, 0x00); sc_u8(s, 0x00);
         sc_u8(s, 0x0F); sc_u8(s, 0x84); p_jz_step = s->pos; sc_u32(s, 0);
-        /* NtProtectVirtualMemory(page, size, PAGE_EXECUTE_READ|PAGE_GUARD, &old) */
-        sc_u8(s, 0x48); sc_u8(s, 0xB9); sc_u64(s, page);   /* mov rcx, page */
-        sc_u8(s, 0x48); sc_u8(s, 0xBA); sc_u64(s, page_end - page); /* mov rdx, size */
-        sc_u8(s, 0x49); sc_u8(s, 0xB8); sc_u64(s, 0x120);  /* mov r8, 0x120 */
-        sc_u8(s, 0x49); sc_u8(s, 0xB9); sc_u64(s, scratch + 0x10); /* mov r9, &old */
-        sc_u8(s, 0x4C); sc_u8(s, 0x8B); sc_u8(s, 0xD1);    /* mov r10, rcx */
-        sc_u8(s, 0xB8); sc_u32(s, syscall_no);             /* mov eax, syscall_no */
-        sc_u8(s, 0x0F); sc_u8(s, 0x05);                    /* syscall */
-        sc_u8(s, 0x48); sc_u8(s, 0xB8); sc_u64(s, scratch);/* mov rax, scratch */
-        sc_u8(s, 0x48); sc_u8(s, 0x8B); sc_u8(s, 0x10);    /* mov rdx,[rax] (Context) */
+        sc_u8(s, 0x48); sc_u8(s, 0xB9); sc_u64(s, page);
+        sc_u8(s, 0x48); sc_u8(s, 0xBA); sc_u64(s, page_end - page);
+        sc_u8(s, 0x49); sc_u8(s, 0xB8); sc_u64(s, 0x120);
+        sc_u8(s, 0x49); sc_u8(s, 0xB9); sc_u64(s, scratch + 0x10);
+        sc_u8(s, 0x4C); sc_u8(s, 0x8B); sc_u8(s, 0xD1);
+        sc_u8(s, 0xB8); sc_u32(s, syscall_no);
+        sc_u8(s, 0x0F); sc_u8(s, 0x05);
+        sc_u8(s, 0x48); sc_u8(s, 0xB8); sc_u64(s, scratch);
+        sc_u8(s, 0x48); sc_u8(s, 0x8B); sc_u8(s, 0x10);
         sc_u8(s, 0x81); sc_u8(s, 0x62); sc_u8(s, 0x44);
-        sc_u8(s, 0xFF); sc_u8(s, 0xFE); sc_u8(s, 0xFF); sc_u8(s, 0xFF); /* and [rdx+0x44],~TF */
+        sc_u8(s, 0xFF); sc_u8(s, 0xFE); sc_u8(s, 0xFF); sc_u8(s, 0xFF);
         sc_u8(s, 0x81); sc_u8(s, 0x62); sc_u8(s, 0x68);
-        sc_u8(s, 0xFF); sc_u8(s, 0xBF); sc_u8(s, 0xFF); sc_u8(s, 0xFF); /* and [rdx+0x68],~0x4000 */
+        sc_u8(s, 0xFF); sc_u8(s, 0xBF); sc_u8(s, 0xFF); sc_u8(s, 0xFF);
         sc_u8(s, 0x31); sc_u8(s, 0xC0); sc_u8(s, 0xC3);
     }
 
     search_at = s->pos;
-    sc_u8(s, 0xB8); sc_u32(s, 1);                          /* mov eax,1 (SEARCH) */
+    sc_u8(s, 0xB8); sc_u32(s, 1);
     sc_u8(s, 0xC3);
 
     fixups[nfix][0] = p_je_step;  fixups[nfix++][1] = step_at;

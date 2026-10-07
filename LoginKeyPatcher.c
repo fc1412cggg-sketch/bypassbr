@@ -1321,16 +1321,49 @@ static BOOL CALLBACK enum_win_cb(HWND hw, LPARAM lp) {
     return FALSE;
 }
 
+static void dump_log(uint64_t total, ExcEnt *ring, uint64_t base) {
+    int k, newest;
+    if (!total) return;
+    newest = (int)((total - 1) & 31);
+    for (k = 2; k >= 0; k--) {
+        int idx = (newest - k + 32) & 31;
+        if (total < (uint64_t)(k + 1)) continue;
+        wprint(L"        #%llu code=0x%08X addr=0x%llX",
+               (unsigned long long)(total - k),
+               (unsigned)(ring[idx].code & 0xFFFFFFFFu),
+               (unsigned long long)ring[idx].addr);
+        if (base && ring[idx].addr >= base && ring[idx].addr < base + 0x10000000)
+            wprint(L" (deef+0x%llX)", (unsigned long long)(ring[idx].addr - base));
+        wprint(L"\n");
+    }
+}
+
 static int watch_run(HANDLE h, DWORD pid, int secs, uint64_t counter, const wchar_t *tag,
-                     uint64_t page, DWORD orig_prot) {
+                     uint64_t page, DWORD orig_prot, uint64_t log_total, uint64_t log_ring,
+                     uint64_t base) {
     int i;
     uint64_t hits = 0, shown = 0;
+    ExcEnt ring[32], tmp[32];
+    uint64_t ltot = 0, lshown = 0;
+    memset(ring, 0, sizeof(ring));
     for (i = 0; i < secs * 10; i++) {
         Sleep(100);
+        if (log_total) {
+            uint64_t t = 0;
+            if (rpm(h, log_total, &t, 8)) ltot = t;
+            if (rpm(h, log_ring, tmp, sizeof(tmp))) memcpy(ring, tmp, sizeof(ring));
+        }
         if (!target_alive(h)) {
             wprint(L"[DIED] %s: ตายหลัง ~%.1f วินาที! ", tag, (i + 1) * 0.1);
             report_exit(h);
+            wprint(L"[*]   exception ที่ handler เห็น: %llu ครั้ง\n", (unsigned long long)ltot);
+            dump_log(ltot, ring, base);
             return 0;
+        }
+        if (log_total && ltot != lshown && (ltot - lshown >= 3 || i % 5 == 4)) {
+            wprint(L"[EXC] เห็น exception แล้ว %llu ครั้ง\n", (unsigned long long)ltot);
+            dump_log(ltot, ring, base);
+            lshown = ltot;
         }
         if (counter) {
             rpm(h, counter, &hits, 8);
@@ -1373,8 +1406,8 @@ static int tool_probe(const char *target_exe, const char *exe_dir) {
         HANDLE h = NULL;
         uint64_t base = 0, hook, mem = 0, datab = 0;
         uint64_t page, main_screen, code_addr, user_str, key_str, user_lng, key_lng;
-        uint64_t counter, scratch, handler;
-        uint8_t veh[320], code[512], st[32], longbuf[256];
+        uint64_t counter, scratch, handler, log_total, log_ring;
+        uint8_t veh[512], code[512], st[32], longbuf[256];
         int n;
         DWORD oldp = 0;
         uint32_t sysno = get_syscall_no("NtProtectVirtualMemory");
@@ -1392,9 +1425,10 @@ static int tool_probe(const char *target_exe, const char *exe_dir) {
         code_addr = mem + L_CODE; user_str = mem + L_USER_STR; key_str = mem + L_KEY_STR;
         user_lng = mem + L_USER_LONG; key_lng = mem + L_KEY_LONG;
         counter = datab + 0x100; scratch = datab + 0x300; handler = mem + 0x500;
+        log_total = datab + 0x108; log_ring = datab + 0x200;
 
         n = sc_guard_veh(veh, page, page + 0x1000, hook, code_addr, counter,
-                         scratch, sysno, s == 0 ? 1 : 0);
+                         scratch, log_total, log_ring, sysno, s == 0 ? 1 : 0);
         wpm(h, handler, veh, (SIZE_T)n);
         n = sc_build_entry(code, main_screen, user_str, key_str);
         wpm(h, code_addr, code, (SIZE_T)n);
@@ -1414,7 +1448,8 @@ static int tool_probe(const char *target_exe, const char *exe_dir) {
         wprint(L"[*]   ตั้ง PAGE_GUARD บนเพจ 0x%llX แล้ว (สิทธิ์เดิม=0x%lX)\n",
                (unsigned long long)page, (unsigned long)oldp);
         if (!install_veh(h, handler, mem, datab)) { CloseHandle(h); continue; }
-        live[s] = watch_run(h, pid, 22, counter, tags[s], page, oldp);
+        live[s] = watch_run(h, pid, 22, counter, tags[s], page, oldp,
+                            log_total, log_ring, base);
         CloseHandle(h);
     }
     kill_deef();
@@ -1456,7 +1491,7 @@ int main(int argc, char **argv) {
     }
 
     wprint(L"=================================================\n");
-    wprint(L"     LOGIN KEY PATCHER v2.13 (GUARD PAGE)          \n");
+    wprint(L"     LOGIN KEY PATCHER v2.14 (GUARD+LOG)          \n");
     wprint(L"=================================================\n");
 
     GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir));
