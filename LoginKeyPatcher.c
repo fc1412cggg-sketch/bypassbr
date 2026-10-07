@@ -1491,7 +1491,7 @@ int main(int argc, char **argv) {
     }
 
     wprint(L"=================================================\n");
-    wprint(L"     LOGIN KEY PATCHER v2.14 (GUARD+LOG)          \n");
+    wprint(L"     LOGIN KEY PATCHER v2.15 (GUARD SAFE)          \n");
     wprint(L"=================================================\n");
 
     GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir));
